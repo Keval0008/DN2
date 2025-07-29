@@ -1,0 +1,226 @@
+"""
+Column matching module for data reconciliation.
+Provides functionality to match categorical columns between datasets.
+"""
+
+import pandas as pd
+from typing import Dict, List, Tuple, Union, Optional
+from enum import Enum
+
+
+class MatchStatus(Enum):
+    """Enumeration for column match status."""
+    SINGLE_MATCH = "single_match"
+    MULTIPLE_MATCHES = "multiple_matches" 
+    NO_MATCH = "no_match"
+
+
+class ColumnMatch:
+    """Data class to represent a column match result."""
+    
+    def __init__(self, original_column: str, matched_columns: List[str], 
+                 status: MatchStatus, similarity_scores: Dict[str, float] = None):
+        self.original_column = original_column
+        self.matched_columns = matched_columns
+        self.status = status
+        self.similarity_scores = similarity_scores or {}
+
+
+def jaccard_similarity(set1: set, set2: set) -> float:
+    """
+    Calculate Jaccard similarity between two sets.
+    
+    Args:
+        set1: First set of values
+        set2: Second set of values
+        
+    Returns:
+        Jaccard similarity score (0.0 to 1.0)
+    """
+    if not set1 and not set2:
+        return 1.0
+    if not set1 or not set2:
+        return 0.0
+        
+    intersection = len(set1.intersection(set2))
+    union = len(set1.union(set2))
+    
+    return intersection / union if union > 0 else 0.0
+
+
+def calculate_value_overlap(original_values: pd.Series, transformed_values: pd.Series, 
+                          min_overlap: float = 0.9) -> float:
+    """
+    Calculate the overlap percentage between two sets of categorical values.
+    
+    Args:
+        original_values: Values from original dataset column
+        transformed_values: Values from transformed dataset column
+        min_overlap: Minimum overlap threshold (default: 0.9)
+        
+    Returns:
+        Overlap percentage (0.0 to 1.0)
+    """
+    original_set = set(original_values.dropna().astype(str))
+    transformed_set = set(transformed_values.dropna().astype(str))
+    
+    return jaccard_similarity(original_set, transformed_set)
+
+
+def find_exact_name_match(original_column: str, transformed_df: pd.DataFrame,
+                         original_values: pd.Series, min_overlap: float = 0.9) -> Optional[ColumnMatch]:
+    """
+    Check for exact column name match with sufficient value overlap.
+    
+    Args:
+        original_column: Name of the original column
+        transformed_df: Transformed dataset
+        original_values: Values from the original column
+        min_overlap: Minimum value overlap threshold
+        
+    Returns:
+        ColumnMatch if exact match found with sufficient overlap, None otherwise
+    """
+    if original_column not in transformed_df.columns:
+        return None
+        
+    transformed_values = transformed_df[original_column]
+    overlap = calculate_value_overlap(original_values, transformed_values, min_overlap)
+    
+    if overlap >= min_overlap:
+        return ColumnMatch(
+            original_column=original_column,
+            matched_columns=[original_column],
+            status=MatchStatus.SINGLE_MATCH,
+            similarity_scores={original_column: overlap}
+        )
+    
+    return None
+
+
+def find_value_based_matches(original_column: str, original_values: pd.Series,
+                           transformed_df: pd.DataFrame, similarity_threshold: float = 0.5) -> ColumnMatch:
+    """
+    Find matching columns based on value similarity using Jaccard similarity.
+    
+    Args:
+        original_column: Name of the original column
+        original_values: Values from the original column
+        transformed_df: Transformed dataset
+        similarity_threshold: Minimum similarity threshold for matching
+        
+    Returns:
+        ColumnMatch with results of similarity-based matching
+    """
+    original_set = set(original_values.dropna().astype(str))
+    similarity_scores = {}
+    
+    # Calculate similarity with all categorical columns in transformed dataset
+    for col in transformed_df.columns:
+        # Consider only columns with reasonable number of unique values (likely categorical)
+        if transformed_df[col].dtype == 'object' or transformed_df[col].nunique() < len(transformed_df) * 0.5:
+            transformed_set = set(transformed_df[col].dropna().astype(str))
+            similarity = jaccard_similarity(original_set, transformed_set)
+            
+            if similarity >= similarity_threshold:
+                similarity_scores[col] = similarity
+    
+    # Determine match status based on number of matches found
+    if not similarity_scores:
+        return ColumnMatch(
+            original_column=original_column,
+            matched_columns=[],
+            status=MatchStatus.NO_MATCH,
+            similarity_scores={}
+        )
+    elif len(similarity_scores) == 1:
+        matched_column = list(similarity_scores.keys())[0]
+        return ColumnMatch(
+            original_column=original_column,
+            matched_columns=[matched_column],
+            status=MatchStatus.SINGLE_MATCH,
+            similarity_scores=similarity_scores
+        )
+    else:
+        # Sort by similarity score (descending)
+        sorted_matches = sorted(similarity_scores.items(), key=lambda x: x[1], reverse=True)
+        matched_columns = [col for col, _ in sorted_matches]
+        
+        return ColumnMatch(
+            original_column=original_column,
+            matched_columns=matched_columns,
+            status=MatchStatus.MULTIPLE_MATCHES,
+            similarity_scores=similarity_scores
+        )
+
+
+def match_categorical_columns(original_df: pd.DataFrame, transformed_df: pd.DataFrame,
+                            selected_columns: List[str], min_name_overlap: float = 0.9,
+                            similarity_threshold: float = 0.5) -> Dict[str, ColumnMatch]:
+    """
+    Match categorical columns between original and transformed datasets.
+    
+    Args:
+        original_df: Original dataset
+        transformed_df: Transformed dataset
+        selected_columns: List of categorical columns from original dataset to match
+        min_name_overlap: Minimum overlap for exact name matches
+        similarity_threshold: Minimum similarity threshold for value-based matching
+        
+    Returns:
+        Dictionary mapping original column names to ColumnMatch objects
+    """
+    column_matches = {}
+    
+    for col in selected_columns:
+        if col not in original_df.columns:
+            raise ValueError(f"Column '{col}' not found in original dataset")
+            
+        original_values = original_df[col]
+        
+        # First, try exact name match with value overlap check
+        exact_match = find_exact_name_match(col, transformed_df, original_values, min_name_overlap)
+        
+        if exact_match:
+            column_matches[col] = exact_match
+        else:
+            # Fall back to value-based similarity matching
+            similarity_match = find_value_based_matches(col, original_values, transformed_df, similarity_threshold)
+            column_matches[col] = similarity_match
+    
+    return column_matches
+
+
+def get_mapping_summary(column_matches: Dict[str, ColumnMatch]) -> Dict[str, Dict]:
+    """
+    Generate a summary of column matching results.
+    
+    Args:
+        column_matches: Dictionary of ColumnMatch objects
+        
+    Returns:
+        Summary dictionary with match statistics and details
+    """
+    summary = {
+        'total_columns': len(column_matches),
+        'single_matches': 0,
+        'multiple_matches': 0,
+        'no_matches': 0,
+        'matches': {}
+    }
+    
+    for original_col, match in column_matches.items():
+        if match.status == MatchStatus.SINGLE_MATCH:
+            summary['single_matches'] += 1
+        elif match.status == MatchStatus.MULTIPLE_MATCHES:
+            summary['multiple_matches'] += 1
+        else:
+            summary['no_matches'] += 1
+            
+        summary['matches'][original_col] = {
+            'status': match.status.value,
+            'matched_columns': match.matched_columns,
+            'similarity_scores': match.similarity_scores
+        }
+    
+    return summary
