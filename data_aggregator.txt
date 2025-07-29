@@ -1,0 +1,210 @@
+"""
+Data aggregation module for data reconciliation.
+Provides functionality to group and aggregate numerical data by categorical columns.
+"""
+
+import pandas as pd
+from typing import List, Dict, Optional, Union
+from column_matcher import ColumnMatch, MatchStatus
+
+
+def validate_numerical_columns(df: pd.DataFrame, numerical_columns: List[str]) -> List[str]:
+    """
+    Validate that specified columns exist and can be converted to numerical values.
+    
+    Args:
+        df: DataFrame to validate
+        numerical_columns: List of column names to validate
+        
+    Returns:
+        List of validated numerical column names
+        
+    Raises:
+        ValueError: If columns don't exist or can't be converted to numerical
+    """
+    validated_columns = []
+    
+    for col in numerical_columns:
+        if col not in df.columns:
+            raise ValueError(f"Column '{col}' not found in dataset")
+            
+        # Try to convert to numeric, will raise error if not possible
+        try:
+            pd.to_numeric(df[col], errors='coerce')
+            validated_columns.append(col)
+        except Exception as e:
+            raise ValueError(f"Column '{col}' cannot be converted to numerical values: {str(e)}")
+    
+    return validated_columns
+
+
+def prepare_grouping_columns(df: pd.DataFrame, column_mapping: Dict[str, str]) -> pd.DataFrame:
+    """
+    Prepare DataFrame with renamed categorical columns for consistent grouping.
+    
+    Args:
+        df: DataFrame to prepare
+        column_mapping: Mapping of original column names to standardized names
+        
+    Returns:
+        DataFrame with renamed categorical columns
+    """
+    df_prepared = df.copy()
+    
+    # Rename columns according to mapping
+    rename_dict = {}
+    for original_col, mapped_col in column_mapping.items():
+        if mapped_col in df.columns:
+            rename_dict[mapped_col] = f"group_{original_col}"
+    
+    if rename_dict:
+        df_prepared = df_prepared.rename(columns=rename_dict)
+    
+    return df_prepared
+
+
+def aggregate_by_groups(df: pd.DataFrame, grouping_columns: List[str], 
+                       numerical_columns: List[str], agg_func: str = 'sum') -> pd.DataFrame:
+    """
+    Group DataFrame by categorical columns and aggregate numerical columns.
+    
+    Args:
+        df: DataFrame to aggregate
+        grouping_columns: List of categorical columns to group by
+        numerical_columns: List of numerical columns to aggregate
+        agg_func: Aggregation function ('sum', 'mean', 'count', etc.)
+        
+    Returns:
+        Aggregated DataFrame with group keys and aggregated values
+    """
+    # Validate inputs
+    missing_group_cols = [col for col in grouping_columns if col not in df.columns]
+    if missing_group_cols:
+        raise ValueError(f"Grouping columns not found: {missing_group_cols}")
+    
+    validated_num_cols = validate_numerical_columns(df, numerical_columns)
+    
+    # Convert numerical columns to numeric type
+    df_copy = df.copy()
+    for col in validated_num_cols:
+        df_copy[col] = pd.to_numeric(df_copy[col], errors='coerce')
+    
+    # Group and aggregate
+    grouped = df_copy.groupby(grouping_columns, as_index=False)[validated_num_cols].agg(agg_func)
+    
+    # Add metadata columns
+    grouped['record_count'] = df_copy.groupby(grouping_columns).size().values
+    
+    return grouped
+
+
+def create_column_mapping_from_matches(column_matches: Dict[str, ColumnMatch]) -> Dict[str, Optional[str]]:
+    """
+    Create a simple column mapping from ColumnMatch results for single matches only.
+    
+    Args:
+        column_matches: Dictionary of ColumnMatch objects
+        
+    Returns:
+        Dictionary mapping original columns to matched columns (single matches only)
+    """
+    mapping = {}
+    
+    for original_col, match in column_matches.items():
+        if match.status == MatchStatus.SINGLE_MATCH and match.matched_columns:
+            mapping[original_col] = match.matched_columns[0]
+        else:
+            mapping[original_col] = None
+    
+    return mapping
+
+
+def aggregate_datasets(original_df: pd.DataFrame, transformed_df: pd.DataFrame,
+                      column_matches: Dict[str, ColumnMatch], numerical_columns: List[str],
+                      agg_func: str = 'sum') -> Dict[str, pd.DataFrame]:
+    """
+    Aggregate both datasets using matched categorical columns.
+    
+    Args:
+        original_df: Original dataset
+        transformed_df: Transformed dataset
+        column_matches: Column matching results
+        numerical_columns: List of numerical columns to aggregate
+        agg_func: Aggregation function to use
+        
+    Returns:
+        Dictionary containing aggregated DataFrames for both datasets
+    """
+    # Create column mapping for single matches only
+    column_mapping = create_column_mapping_from_matches(column_matches)
+    
+    # Get successfully matched columns
+    matched_columns = [(orig, trans) for orig, trans in column_mapping.items() if trans is not None]
+    
+    if not matched_columns:
+        raise ValueError("No single column matches found. Cannot proceed with aggregation.")
+    
+    # Extract original and transformed column names
+    original_group_cols = [orig for orig, _ in matched_columns]
+    transformed_group_cols = [trans for _, trans in matched_columns]
+    
+    # Validate numerical columns exist in both datasets
+    original_num_cols = validate_numerical_columns(original_df, numerical_columns)
+    transformed_num_cols = validate_numerical_columns(transformed_df, numerical_columns)
+    
+    # Find common numerical columns
+    common_num_cols = list(set(original_num_cols) & set(transformed_num_cols))
+    if not common_num_cols:
+        raise ValueError("No common numerical columns found between datasets")
+    
+    # Aggregate original dataset
+    original_agg = aggregate_by_groups(original_df, original_group_cols, common_num_cols, agg_func)
+    
+    # Aggregate transformed dataset
+    transformed_agg = aggregate_by_groups(transformed_df, transformed_group_cols, common_num_cols, agg_func)
+    
+    # Standardize column names for comparison
+    # Rename transformed dataset columns to match original
+    rename_dict = {trans: orig for orig, trans in zip(original_group_cols, transformed_group_cols)}
+    transformed_agg = transformed_agg.rename(columns=rename_dict)
+    
+    return {
+        'original': original_agg,
+        'transformed': transformed_agg,
+        'grouping_columns': original_group_cols,
+        'numerical_columns': common_num_cols,
+        'column_mapping': dict(matched_columns)
+    }
+
+
+def get_aggregation_summary(aggregated_data: Dict[str, pd.DataFrame]) -> Dict:
+    """
+    Generate summary statistics for aggregated data.
+    
+    Args:
+        aggregated_data: Dictionary containing aggregated datasets
+        
+    Returns:
+        Summary dictionary with aggregation statistics
+    """
+    original_agg = aggregated_data['original']
+    transformed_agg = aggregated_data['transformed']
+    
+    summary = {
+        'original_groups': len(original_agg),
+        'transformed_groups': len(transformed_agg),
+        'grouping_columns': aggregated_data['grouping_columns'],
+        'numerical_columns': aggregated_data['numerical_columns'],
+        'column_mapping': aggregated_data['column_mapping'],
+        'original_totals': {},
+        'transformed_totals': {}
+    }
+    
+    # Calculate totals for numerical columns
+    for col in aggregated_data['numerical_columns']:
+        if col in original_agg.columns:
+            summary['original_totals'][col] = original_agg[col].sum()
+        if col in transformed_agg.columns:
+            summary['transformed_totals'][col] = transformed_agg[col].sum()
+    
+    return summary
