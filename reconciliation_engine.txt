@@ -1,0 +1,404 @@
+"""
+Main reconciliation engine that orchestrates the data reconciliation process.
+Combines column matching, data aggregation, and anomaly detection.
+"""
+
+import pandas as pd
+from typing import Dict, List, Optional, Union, Tuple
+import logging
+from datetime import datetime
+
+from column_matcher import (
+    match_categorical_columns, 
+    get_mapping_summary, 
+    ColumnMatch, 
+    MatchStatus
+)
+from data_aggregator import (
+    aggregate_datasets,
+    get_aggregation_summary
+)
+from anomaly_detector import (
+    compare_and_detect_anomalies,
+    filter_anomalies
+)
+
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+class DataReconciliationEngine:
+    """
+    Main engine for data reconciliation between original and transformed datasets.
+    """
+    
+    def __init__(self, original_df: pd.DataFrame, transformed_df: pd.DataFrame):
+        """
+        Initialize the reconciliation engine with datasets.
+        
+        Args:
+            original_df: Original dataset
+            transformed_df: Transformed dataset
+        """
+        self.original_df = original_df.copy()
+        self.transformed_df = transformed_df.copy()
+        self.column_matches = None
+        self.aggregated_data = None
+        self.anomaly_results = None
+        self.reconciliation_complete = False
+        
+        # Validate inputs
+        if self.original_df.empty or self.transformed_df.empty:
+            raise ValueError("Input datasets cannot be empty")
+        
+        logger.info(f"Initialized reconciliation engine with {len(self.original_df)} original records "
+                   f"and {len(self.transformed_df)} transformed records")
+    
+    def match_columns(self, categorical_columns: List[str], 
+                     min_name_overlap: float = 0.9,
+                     similarity_threshold: float = 0.5) -> Dict[str, ColumnMatch]:
+        """
+        Match categorical columns between datasets.
+        
+        Args:
+            categorical_columns: List of categorical columns from original dataset
+            min_name_overlap: Minimum overlap for exact name matches
+            similarity_threshold: Minimum similarity for value-based matching
+            
+        Returns:
+            Dictionary of column matches
+        """
+        logger.info(f"Starting column matching for {len(categorical_columns)} columns")
+        
+        self.column_matches = match_categorical_columns(
+            self.original_df,
+            self.transformed_df,
+            categorical_columns,
+            min_name_overlap,
+            similarity_threshold
+        )
+        
+        # Log matching results
+        summary = get_mapping_summary(self.column_matches)
+        logger.info(f"Column matching complete: {summary['single_matches']} single matches, "
+                   f"{summary['multiple_matches']} multiple matches, "
+                   f"{summary['no_matches']} no matches")
+        
+        return self.column_matches
+    
+    def resolve_multiple_matches(self, column_resolutions: Dict[str, str]) -> None:
+        """
+        Resolve multiple matches by accepting user choices.
+        
+        Args:
+            column_resolutions: Dictionary mapping original columns to chosen transformed columns
+        """
+        if not self.column_matches:
+            raise ValueError("Must run column matching first")
+        
+        logger.info(f"Resolving {len(column_resolutions)} multiple matches")
+        
+        for original_col, chosen_col in column_resolutions.items():
+            if original_col in self.column_matches:
+                match = self.column_matches[original_col]
+                if match.status == MatchStatus.MULTIPLE_MATCHES:
+                    if chosen_col in match.matched_columns:
+                        # Update to single match
+                        self.column_matches[original_col] = ColumnMatch(
+                            original_column=original_col,
+                            matched_columns=[chosen_col],
+                            status=MatchStatus.SINGLE_MATCH,
+                            similarity_scores={chosen_col: match.similarity_scores.get(chosen_col, 0.0)}
+                        )
+                        logger.info(f"Resolved {original_col} -> {chosen_col}")
+                    else:
+                        logger.warning(f"Chosen column {chosen_col} not in available matches for {original_col}")
+    
+    def aggregate_data(self, numerical_columns: List[str], 
+                      agg_func: str = 'sum') -> Dict[str, pd.DataFrame]:
+        """
+        Aggregate both datasets using matched categorical columns.
+        
+        Args:
+            numerical_columns: List of numerical columns to aggregate
+            agg_func: Aggregation function to use
+            
+        Returns:
+            Dictionary containing aggregated datasets
+        """
+        if not self.column_matches:
+            raise ValueError("Must run column matching first")
+        
+        logger.info(f"Starting data aggregation for {len(numerical_columns)} numerical columns")
+        
+        self.aggregated_data = aggregate_datasets(
+            self.original_df,
+            self.transformed_df,
+            self.column_matches,
+            numerical_columns,
+            agg_func
+        )
+        
+        # Log aggregation results
+        summary = get_aggregation_summary(self.aggregated_data)
+        logger.info(f"Aggregation complete: {summary['original_groups']} original groups, "
+                   f"{summary['transformed_groups']} transformed groups")
+        
+        return self.aggregated_data
+    
+    def detect_anomalies(self, threshold: float = 10.0, 
+                        threshold_type: str = 'absolute') -> Dict[str, Union[pd.DataFrame, Dict]]:
+        """
+        Detect anomalies in the aggregated data.
+        
+        Args:
+            threshold: Threshold value for anomaly detection
+            threshold_type: Type of threshold ('absolute' or 'percentage')
+            
+        Returns:
+            Dictionary containing anomaly detection results
+        """
+        if not self.aggregated_data:
+            raise ValueError("Must run data aggregation first")
+        
+        logger.info(f"Starting anomaly detection with {threshold_type} threshold of {threshold}")
+        
+        self.anomaly_results = compare_and_detect_anomalies(
+            self.aggregated_data,
+            threshold,
+            threshold_type
+        )
+        
+        # Log anomaly detection results
+        summary = self.anomaly_results['summary']
+        logger.info(f"Anomaly detection complete: {summary['total_anomalies']} anomalies found "
+                   f"out of {summary['total_comparisons']} comparisons "
+                   f"({summary['anomaly_rate']:.2f}% anomaly rate)")
+        
+        return self.anomaly_results
+    
+    def run_full_reconciliation(self, categorical_columns: List[str], 
+                               numerical_columns: List[str],
+                               column_resolutions: Dict[str, str] = None,
+                               threshold: float = 10.0,
+                               threshold_type: str = 'absolute',
+                               min_name_overlap: float = 0.9,
+                               similarity_threshold: float = 0.5,
+                               agg_func: str = 'sum') -> Dict:
+        """
+        Run the complete reconciliation process.
+        
+        Args:
+            categorical_columns: List of categorical columns from original dataset
+            numerical_columns: List of numerical columns to reconcile
+            column_resolutions: Optional resolutions for multiple matches
+            threshold: Threshold for anomaly detection
+            threshold_type: Type of threshold ('absolute' or 'percentage')
+            min_name_overlap: Minimum overlap for exact name matches
+            similarity_threshold: Minimum similarity for value-based matching
+            agg_func: Aggregation function to use
+            
+        Returns:
+            Complete reconciliation results
+        """
+        logger.info("Starting full reconciliation process")
+        start_time = datetime.now()
+        
+        try:
+            # Step 1: Match columns
+            column_matches = self.match_columns(
+                categorical_columns, min_name_overlap, similarity_threshold
+            )
+            
+            # Step 2: Resolve multiple matches if provided
+            if column_resolutions:
+                self.resolve_multiple_matches(column_resolutions)
+            
+            # Step 3: Check if we have enough single matches to proceed
+            single_matches = sum(1 for match in self.column_matches.values() 
+                               if match.status == MatchStatus.SINGLE_MATCH)
+            
+            if single_matches == 0:
+                raise ValueError("No single column matches found. Cannot proceed with reconciliation. "
+                               "Please resolve multiple matches or adjust matching parameters.")
+            
+            # Step 4: Aggregate data
+            aggregated_data = self.aggregate_data(numerical_columns, agg_func)
+            
+            # Step 5: Detect anomalies
+            anomaly_results = self.detect_anomalies(threshold, threshold_type)
+            
+            self.reconciliation_complete = True
+            end_time = datetime.now()
+            
+            logger.info(f"Full reconciliation completed in {(end_time - start_time).total_seconds():.2f} seconds")
+            
+            return {
+                'column_matches': get_mapping_summary(self.column_matches),
+                'aggregation_summary': get_aggregation_summary(self.aggregated_data),
+                'anomaly_results': self.anomaly_results,
+                'execution_time': (end_time - start_time).total_seconds(),
+                'success': True
+            }
+            
+        except Exception as e:
+            logger.error(f"Reconciliation failed: {str(e)}")
+            return {
+                'error': str(e),
+                'success': False,
+                'execution_time': (datetime.now() - start_time).total_seconds()
+            }
+    
+    def get_anomaly_report(self, filters: Dict = None) -> pd.DataFrame:
+        """
+        Get filtered anomaly report.
+        
+        Args:
+            filters: Optional filters to apply
+            
+        Returns:
+            Filtered anomaly report DataFrame
+        """
+        if not self.anomaly_results:
+            raise ValueError("Must run anomaly detection first")
+        
+        return filter_anomalies(self.anomaly_results['anomaly_report'], filters)
+    
+    def export_results(self, output_dir: str = './reconciliation_results') -> Dict[str, str]:
+        """
+        Export reconciliation results to files.
+        
+        Args:
+            output_dir: Directory to save results
+            
+        Returns:
+            Dictionary of exported file paths
+        """
+        if not self.reconciliation_complete:
+            raise ValueError("Must complete full reconciliation first")
+        
+        import os
+        os.makedirs(output_dir, exist_ok=True)
+        
+        exported_files = {}
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        try:
+            # Export column matching results
+            if self.column_matches:
+                mapping_summary = get_mapping_summary(self.column_matches)
+                mapping_df = pd.DataFrame([
+                    {
+                        'original_column': col,
+                        'status': match['status'],
+                        'matched_columns': ', '.join(match['matched_columns']),
+                        'best_similarity': max(match['similarity_scores'].values()) if match['similarity_scores'] else 0
+                    }
+                    for col, match in mapping_summary['matches'].items()
+                ])
+                
+                mapping_file = os.path.join(output_dir, f'column_mapping_{timestamp}.csv')
+                mapping_df.to_csv(mapping_file, index=False)
+                exported_files['column_mapping'] = mapping_file
+            
+            # Export aggregated data
+            if self.aggregated_data:
+                original_file = os.path.join(output_dir, f'original_aggregated_{timestamp}.csv')
+                self.aggregated_data['original'].to_csv(original_file, index=False)
+                exported_files['original_aggregated'] = original_file
+                
+                transformed_file = os.path.join(output_dir, f'transformed_aggregated_{timestamp}.csv')
+                self.aggregated_data['transformed'].to_csv(transformed_file, index=False)
+                exported_files['transformed_aggregated'] = transformed_file
+            
+            # Export anomaly results
+            if self.anomaly_results:
+                anomalies_file = os.path.join(output_dir, f'anomaly_report_{timestamp}.csv')
+                self.anomaly_results['anomaly_report'].to_csv(anomalies_file, index=False)
+                exported_files['anomaly_report'] = anomalies_file
+                
+                # Export only anomalies
+                anomalies_only = self.get_anomaly_report({'only_anomalies': True})
+                if not anomalies_only.empty:
+                    anomalies_only_file = os.path.join(output_dir, f'anomalies_only_{timestamp}.csv')
+                    anomalies_only.to_csv(anomalies_only_file, index=False)
+                    exported_files['anomalies_only'] = anomalies_only_file
+            
+            logger.info(f"Results exported to {len(exported_files)} files in {output_dir}")
+            return exported_files
+            
+        except Exception as e:
+            logger.error(f"Failed to export results: {str(e)}")
+            raise
+
+
+def create_sample_datasets() -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Create sample datasets for testing the reconciliation engine.
+    
+    Returns:
+        Tuple of (original_df, transformed_df)
+    """
+    # Original dataset
+    original_data = {
+        'region': ['North', 'South', 'East', 'West', 'North', 'South'],
+        'product_category': ['A', 'B', 'A', 'B', 'C', 'C'],
+        'sales': [100, 200, 150, 300, 250, 180],
+        'quantity': [10, 20, 15, 30, 25, 18],
+        'date': pd.date_range('2023-01-01', periods=6)
+    }
+    
+    # Transformed dataset (with some changes)
+    transformed_data = {
+        'region_name': ['North', 'South', 'East', 'West', 'North'],  # Missing one record
+        'category': ['A', 'B', 'A', 'B', 'C'],  # Different column name
+        'total_sales': [105, 200, 145, 295, 250],  # Slightly different values
+        'total_quantity': [10, 20, 15, 30, 25],
+        'process_date': pd.date_range('2023-01-01', periods=5)
+    }
+    
+    return pd.DataFrame(original_data), pd.DataFrame(transformed_data)
+
+
+if __name__ == "__main__":
+    # Example usage
+    original_df, transformed_df = create_sample_datasets()
+    
+    # Initialize engine
+    engine = DataReconciliationEngine(original_df, transformed_df)
+    
+    # Run full reconciliation
+    results = engine.run_full_reconciliation(
+        categorical_columns=['region', 'product_category'],
+        numerical_columns=['sales', 'quantity'],
+        threshold=10.0
+    )
+    
+    if results['success']:
+        print("Reconciliation completed successfully!")
+        print(f"Execution time: {results['execution_time']:.2f} seconds")
+        
+        # Display results
+        print("\nColumn Matching Summary:")
+        for col, match_info in results['column_matches']['matches'].items():
+            print(f"  {col}: {match_info['status']} -> {match_info['matched_columns']}")
+        
+        print(f"\nAggregation Summary:")
+        agg_summary = results['aggregation_summary']
+        print(f"  Original groups: {agg_summary['original_groups']}")
+        print(f"  Transformed groups: {agg_summary['transformed_groups']}")
+        
+        print(f"\nAnomaly Summary:")
+        anomaly_summary = results['anomaly_results']['summary']
+        print(f"  Total anomalies: {anomaly_summary['total_anomalies']}")
+        print(f"  Anomaly rate: {anomaly_summary['anomaly_rate']:.2f}%")
+        
+        # Show anomalies
+        anomaly_report = engine.get_anomaly_report({'only_anomalies': True})
+        if not anomaly_report.empty:
+            print(f"\nDetected Anomalies:")
+            print(anomaly_report.to_string(index=False))
+    else:
+        print(f"Reconciliation failed: {results['error']}")
