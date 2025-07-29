@@ -16,10 +16,13 @@ def jaccard_similarity(set1, set2):
     union = len(set1.union(set2))
     return intersection / union if union > 0 else 0
 
-# Match categorical columns between original and transformed datasets
-def match_categorical_columns(original_df, transformed_df, threshold=0.9):
+# Match columns (categorical or numerical) between original and transformed datasets
+def match_columns(original_df, transformed_df, column_type='object', threshold=0.9):
     matches = []
-    for orig_col in original_df.select_dtypes(include=['object', 'category']).columns:
+    dtype_filter = ['object', 'category'] if column_type == 'categorical' else ['int64', 'float64']
+    orig_cols = original_df.select_dtypes(include=dtype_filter).columns
+    
+    for orig_col in orig_cols:
         match_info = {'original_column': orig_col, 'transformed_column': None, 'status': 'no_match', 'similarity': 0}
         
         # Check for exact name match first
@@ -34,7 +37,7 @@ def match_categorical_columns(original_df, transformed_df, threshold=0.9):
         
         # Fuzzy matching with other columns
         potential_matches = []
-        for trans_col in transformed_df.select_dtypes(include=['object', 'category']).columns:
+        for trans_col in transformed_df.select_dtypes(include=dtype_filter).columns:
             similarity = jaccard_similarity(original_df[orig_col].dropna(), transformed_df[trans_col].dropna())
             if similarity >= threshold:
                 potential_matches.append((trans_col, similarity))
@@ -51,32 +54,35 @@ def match_categorical_columns(original_df, transformed_df, threshold=0.9):
     return matches
 
 # Group and aggregate numerical columns
-def group_and_aggregate(original_df, transformed_df, cat_matches, num_columns):
-    matched_cols = [(m['original_column'], m['transformed_column']) for m in cat_matches 
-                    if m['status'] == 'single_match' and m['transformed_column'] is not None]
-    if not matched_cols:
+def group_and_aggregate(original_df, transformed_df, cat_matches, num_matches):
+    cat_matched_cols = [(m['original_column'], m['transformed_column']) for m in cat_matches 
+                        if m['status'] == 'single_match' and m['transformed_column'] is not None]
+    num_matched_cols = [(m['original_column'], m['transformed_column']) for m in num_matches 
+                        if m['status'] == 'single_match' and m['transformed_column'] is not None]
+    if not cat_matched_cols or not num_matched_cols:
         return None, None
     
-    orig_group_cols, trans_group_cols = zip(*matched_cols)
-    orig_agg = original_df.groupby(list(orig_group_cols))[num_columns].sum().reset_index()
-    trans_agg = transformed_df.groupby(list(trans_group_cols))[num_columns].sum().reset_index()
-    return orig_agg, trans_agg
+    orig_group_cols, trans_group_cols = zip(*cat_matched_cols)
+    orig_num_cols, trans_num_cols = zip(*num_matched_cols)
+    orig_agg = original_df.groupby(list(orig_group_cols))[list(orig_num_cols)].sum().reset_index()
+    trans_agg = transformed_df.groupby(list(trans_group_cols))[list(trans_num_cols)].sum().reset_index()
+    return orig_agg, trans_agg, orig_num_cols, trans_num_cols
 
 # Compare aggregated results and flag anomalies
-def compare_and_flag_anomalies(orig_agg, trans_agg, num_columns, threshold):
+def compare_and_flag_anomalies(orig_agg, trans_agg, orig_num_cols, trans_num_cols, threshold):
     if orig_agg is None or trans_agg is None:
         return None
     
     # Merge on group columns
-    group_cols = [col for col in orig_agg.columns if col not in num_columns]
+    group_cols = [col for col in orig_agg.columns if col not in orig_num_cols]
     merged = orig_agg.merge(trans_agg, on=group_cols, suffixes=('_orig', '_trans'))
     
     results = []
-    for num_col in num_columns:
-        diff_col = f'{num_col}_diff'
-        merged[diff_col] = abs(merged[f'{num_col}_orig'] - merged[f'{num_col}_trans'])
-        merged[f'{num_col}_anomaly'] = merged[diff_col] > threshold
-        results.append(merged[group_cols + [f'{num_col}_orig', f'{num_col}_trans', diff_col, f'{num_col}_anomaly']])
+    for orig_col, trans_col in zip(orig_num_cols, trans_num_cols):
+        diff_col = f'{orig_col}_diff'
+        merged[diff_col] = abs(merged[f'{orig_col}_orig'] - merged[f'{trans_col}_trans'])
+        merged[f'{orig_col}_anomaly'] = merged[diff_col] > threshold
+        results.append(merged[group_cols + [f'{orig_col}_orig', f'{trans_col}_trans', diff_col, f'{orig_col}_anomaly']])
     
     return pd.concat(results, axis=1).loc[:, ~pd.DataFrame().columns.duplicated()]
 
@@ -101,26 +107,34 @@ app.layout = html.Div(className='container mx-auto p-4 max-w-6xl', children=[
             children=html.Button('Upload Original Dataset (CSV)', className='bg-blue-500 text-white px-4 py-2 rounded mr-2'),
             accept='.csv',
         ),
+        html.Div(id='original-upload-status', className='text-green-600 mt-2'),
         dcc.Upload(
             id='upload-transformed',
             children=html.Button('Upload Transformed Dataset (CSV)', className='bg-blue-500 text-white px-4 py-2 rounded'),
             accept='.csv',
         ),
+        html.Div(id='transformed-upload-status', className='text-green-600 mt-2'),
     ]),
     
-    # Categorical column selection
+    # Categorical column matching
     html.Div(id='cat-selection-container', className='mb-6', children=[
-        html.H2('Select Categorical Columns', className='text-lg font-semibold mb-2'),
-        html.Label('Original Dataset Columns:', className='block mb-1'),
+        html.H2('Match Categorical Columns', className='text-lg font-semibold mb-2'),
+        html.Label('Select Categorical Columns from Original Dataset:', className='block mb-1'),
         dcc.Dropdown(id='cat-columns', multi=True, className='mb-4'),
-        html.Div(id='match-results', className='mb-4'),
+        html.Div(id='cat-match-results', className='mb-4'),
     ]),
     
-    # Numerical column selection and threshold
+    # Numerical column matching
+    html.Div(id='num-selection-container', className='mb-6', children=[
+        html.H2('Match Numerical Columns', className='text-lg font-semibold mb-2'),
+        html.Label('Select Numerical Columns from Original Dataset:', className='block mb-1'),
+        dcc.Dropdown(id='num-columns', multi=True, className='mb-4'),
+        html.Div(id='num-match-results', className='mb-4'),
+    ]),
+    
+    # Threshold input
     html.Div(className='mb-6', children=[
-        html.H2('Select Numerical Columns and Threshold', className='text-lg font-semibold mb-2'),
-        html.Label('Numerical Columns:', className='block mb-1'),
-        dcc.Dropdown(id='num-columns', multi=True, className='mb-2'),
+        html.H2('Set Anomaly Threshold', className='text-lg font-semibold mb-2'),
         html.Label('Anomaly Threshold:', className='block mb-1'),
         dcc.Input(id='threshold', type='number', value=10, className='border p-2 rounded w-full mb-2'),
         html.Button('Run Reconciliation', id='run-reconciliation', className='bg-green-500 text-white px-4 py-2 rounded'),
@@ -137,7 +151,8 @@ app.layout = html.Div(className='container mx-auto p-4 max-w-6xl', children=[
     # Store data
     dcc.Store(id='original-data'),
     dcc.Store(id='transformed-data'),
-    dcc.Store(id='match-data'),
+    dcc.Store(id='cat-match-data'),
+    dcc.Store(id='num-match-data'),
 ])
 
 # Parse uploaded CSV
@@ -147,45 +162,50 @@ def parse_csv(contents, filename):
     df = pd.read_csv(BytesIO(decoded))
     return df
 
-# Callbacks
+# Callbacks for file uploads
 @app.callback(
     [Output('cat-columns', 'options'),
-     Output('original-data', 'data')],
+     Output('num-columns', 'options'),
+     Output('original-data', 'data'),
+     Output('original-upload-status', 'children')],
     Input('upload-original', 'contents'),
     State('upload-original', 'filename')
 )
 def update_original_upload(contents, filename):
     if contents is None:
-        return [], None
+        return [], [], None, ""
     df = parse_csv(contents, filename)
     cat_cols = [{'label': col, 'value': col} for col in df.select_dtypes(include=['object', 'category']).columns]
-    return cat_cols, df.to_json()
+    num_cols = [{'label': col, 'value': col} for col in df.select_dtypes(include=['int64', 'float64']).columns]
+    return cat_cols, num_cols, df.to_json(), f"Successfully uploaded: {filename}"
 
 @app.callback(
-    Output('transformed-data', 'data'),
+    [Output('transformed-data', 'data'),
+     Output('transformed-upload-status', 'children')],
     Input('upload-transformed', 'contents'),
     State('upload-transformed', 'filename')
 )
 def update_transformed_upload(contents, filename):
     if contents is None:
-        return None
+        return None, ""
     df = parse_csv(contents, filename)
-    return df.to_json()
+    return df.to_json(), f"Successfully uploaded: {filename}"
 
+# Callback for categorical column matching
 @app.callback(
-    Output('match-results', 'children'),
-    Output('match-data', 'data'),
+    [Output('cat-match-results', 'children'),
+     Output('cat-match-data', 'data')],
     Input('cat-columns', 'value'),
     State('original-data', 'data'),
     State('transformed-data', 'data')
 )
-def update_matches(selected_cols, orig_json, trans_json):
+def update_cat_matches(selected_cols, orig_json, trans_json):
     if not selected_cols or not orig_json or not trans_json:
-        return "Please upload both datasets and select categorical columns.", None
+        return [html.P("Please upload both datasets and select categorical columns.")], None
     
     orig_df = pd.read_json(orig_json)
     trans_df = pd.read_json(trans_json)
-    matches = match_categorical_columns(orig_df, trans_df)
+    matches = match_columns(orig_df, trans_df, column_type='categorical')
     
     match_elements = []
     match_data = []
@@ -197,11 +217,12 @@ def update_matches(selected_cols, orig_json, trans_json):
             match_data.append(match)
         elif match['status'] == 'multiple_matches':
             match_elements.append(html.Div([
-                html.P(f"{match['original_column']} has multiple matches:"),
+                html.Label(f"Select match for {match['original_column']}:", className='block mb-1'),
                 dcc.Dropdown(
-                    id={'type': 'match-selector', 'index': match['original_column']},
+                    id={'type': 'cat-match-selector', 'index': match['original_column']},
                     options=[{'label': f"{col} (Similarity: {sim:.2%})", 'value': col} for col, sim in match['potential_matches']],
                     placeholder="Select a match",
+                    className='mb-2'
                 )
             ]))
             match_data.append(match)
@@ -211,49 +232,89 @@ def update_matches(selected_cols, orig_json, trans_json):
     
     return match_elements, match_data
 
+# Callback for numerical column matching
 @app.callback(
-    Output('num-columns', 'options'),
-    Input('original-data', 'data')
+    [Output('num-match-results', 'children'),
+     Output('num-match-data', 'data')],
+    Input('num-columns', 'value'),
+    State('original-data', 'data'),
+    State('transformed-data', 'data')
 )
-def update_num_columns(orig_json):
-    if not orig_json:
-        return []
-    df = pd.read_json(orig_json)
-    num_cols = [{'label': col, 'value': col} for col in df.select_dtypes(include=['int64', 'float64']).columns]
-    return num_cols
+def update_num_matches(selected_cols, orig_json, trans_json):
+    if not selected_cols or not orig_json or not trans_json:
+        return [html.P("Please upload both datasets and select numerical columns.")], None
+    
+    orig_df = pd.read_json(orig_json)
+    trans_df = pd.read_json(trans_json)
+    matches = match_columns(orig_df, trans_df, column_type='numerical')
+    
+    match_elements = []
+    match_data = []
+    for match in matches:
+        if match['original_column'] not in selected_cols:
+            continue
+        if match['status'] == 'single_match':
+            match_elements.append(html.P(f"{match['original_column']} → {match['transformed_column']} (Similarity: {match['similarity']:.2%})"))
+            match_data.append(match)
+        elif match['status'] == 'multiple_matches':
+            match_elements.append(html.Div([
+                html.Label(f"Select match for {match['original_column']}:", className='block mb-1'),
+                dcc.Dropdown(
+                    id={'type': 'num-match-selector', 'index': match['original_column']},
+                    options=[{'label': f"{col} (Similarity: {sim:.2%})", 'value': col} for col, sim in match['potential_matches']],
+                    placeholder="Select a match",
+                    className='mb-2'
+                )
+            ]))
+            match_data.append(match)
+        else:
+            match_elements.append(html.P(f"{match['original_column']} → No match found"))
+            match_data.append(match)
+    
+    return match_elements, match_data
 
+# Callback for reconciliation
 @app.callback(
     [Output('results-table', 'data'),
      Output('results-table', 'columns'),
      Output('download-link', 'href')],
     Input('run-reconciliation', 'n_clicks'),
-    Input({'type': 'match-selector', 'index': ALL}, 'value'),
+    Input({'type': 'cat-match-selector', 'index': ALL}, 'value'),
+    Input({'type': 'num-match-selector', 'index': ALL}, 'value'),
     State('cat-columns', 'value'),
     State('num-columns', 'value'),
     State('threshold', 'value'),
     State('original-data', 'data'),
     State('transformed-data', 'data'),
-    State('match-data', 'data')
+    State('cat-match-data', 'data'),
+    State('num-match-data', 'data')
 )
-def run_reconciliation(n_clicks, match_selections, cat_columns, num_columns, threshold, orig_json, trans_json, match_data):
+def run_reconciliation(n_clicks, cat_match_selections, num_match_selections, cat_columns, num_columns, threshold, orig_json, trans_json, cat_match_data, num_match_data):
     if not n_clicks or not orig_json or not trans_json or not cat_columns or not num_columns:
         return [], [], ""
     
     orig_df = pd.read_json(orig_json)
     trans_df = pd.read_json(trans_json)
     
-    # Update matches with user selections
-    updated_matches = match_data.copy()
-    for match, selection in zip(updated_matches, match_selections):
+    # Update categorical matches with user selections
+    updated_cat_matches = cat_match_data.copy() if cat_match_data else []
+    for match, selection in zip(updated_cat_matches, cat_match_selections):
         if match['status'] == 'multiple_matches' and selection:
             match['transformed_column'] = selection
             match['status'] = 'single_match'
     
-    orig_agg, trans_agg = group_and_aggregate(orig_df, trans_df, updated_matches, num_columns)
+    # Update numerical matches with user selections
+    updated_num_matches = num_match_data.copy() if num_match_data else []
+    for match, selection in zip(updated_num_matches, num_match_selections):
+        if match['status'] == 'multiple_matches' and selection:
+            match['transformed_column'] = selection
+            match['status'] = 'single_match'
+    
+    orig_agg, trans_agg, orig_num_cols, trans_num_cols = group_and_aggregate(orig_df, trans_df, updated_cat_matches, updated_num_matches)
     if orig_agg is None:
         return [], [], ""
     
-    result_df = compare_and_flag_anomalies(orig_agg, trans_agg, num_columns, threshold)
+    result_df = compare_and_flag_anomalies(orig_agg, trans_agg, orig_num_cols, trans_num_cols, threshold)
     if result_df is None:
         return [], [], ""
     
