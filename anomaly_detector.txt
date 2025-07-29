@@ -1,0 +1,333 @@
+"""
+Anomaly detection module for data reconciliation.
+Provides functionality to compare aggregated datasets and flag anomalies.
+"""
+
+import pandas as pd
+import numpy as np
+from typing import Dict, List, Optional, Union, Tuple
+from enum import Enum
+
+
+class AnomalyType(Enum):
+    """Enumeration for types of anomalies."""
+    THRESHOLD_EXCEEDED = "threshold_exceeded"
+    MISSING_IN_ORIGINAL = "missing_in_original"
+    MISSING_IN_TRANSFORMED = "missing_in_transformed"
+    ZERO_SUM_MISMATCH = "zero_sum_mismatch"
+
+
+class AnomalyResult:
+    """Data class to represent an anomaly detection result."""
+    
+    def __init__(self, group_keys: Dict, original_value: float, transformed_value: float,
+                 difference: float, anomaly_type: AnomalyType, threshold: float = None):
+        self.group_keys = group_keys
+        self.original_value = original_value
+        self.transformed_value = transformed_value
+        self.difference = difference
+        self.anomaly_type = anomaly_type
+        self.threshold = threshold
+        self.is_anomaly = True
+
+
+def calculate_differences(original_agg: pd.DataFrame, transformed_agg: pd.DataFrame,
+                         grouping_columns: List[str], numerical_columns: List[str]) -> pd.DataFrame:
+    """
+    Calculate differences between original and transformed aggregated data.
+    
+    Args:
+        original_agg: Aggregated original dataset
+        transformed_agg: Aggregated transformed dataset
+        grouping_columns: List of grouping columns
+        numerical_columns: List of numerical columns to compare
+        
+    Returns:
+        DataFrame with differences calculated for each group and numerical column
+    """
+    # Merge datasets on grouping columns
+    merged = pd.merge(
+        original_agg, 
+        transformed_agg, 
+        on=grouping_columns, 
+        how='outer', 
+        suffixes=('_original', '_transformed')
+    )
+    
+    # Calculate differences for each numerical column
+    for col in numerical_columns:
+        original_col = f"{col}_original"
+        transformed_col = f"{col}_transformed"
+        difference_col = f"{col}_difference"
+        abs_difference_col = f"{col}_abs_difference"
+        
+        # Fill NaN values with 0 for calculation
+        merged[original_col] = merged[original_col].fillna(0)
+        merged[transformed_col] = merged[transformed_col].fillna(0)
+        
+        # Calculate differences
+        merged[difference_col] = merged[transformed_col] - merged[original_col]
+        merged[abs_difference_col] = abs(merged[difference_col])
+    
+    return merged
+
+
+def detect_threshold_anomalies(differences_df: pd.DataFrame, numerical_columns: List[str],
+                             threshold: float, threshold_type: str = 'absolute') -> pd.DataFrame:
+    """
+    Detect anomalies based on threshold criteria.
+    
+    Args:
+        differences_df: DataFrame with calculated differences
+        numerical_columns: List of numerical columns to check
+        threshold: Threshold value for anomaly detection
+        threshold_type: Type of threshold ('absolute', 'percentage')
+        
+    Returns:
+        DataFrame with anomaly flags added
+    """
+    anomaly_df = differences_df.copy()
+    
+    for col in numerical_columns:
+        abs_diff_col = f"{col}_abs_difference"
+        anomaly_col = f"{col}_anomaly"
+        anomaly_type_col = f"{col}_anomaly_type"
+        
+        if threshold_type == 'absolute':
+            # Absolute threshold
+            anomaly_mask = anomaly_df[abs_diff_col] > threshold
+        elif threshold_type == 'percentage':
+            # Percentage threshold relative to original value
+            original_col = f"{col}_original"
+            percentage_diff = (anomaly_df[abs_diff_col] / anomaly_df[original_col].replace(0, np.nan)) * 100
+            anomaly_mask = percentage_diff > threshold
+        else:
+            raise ValueError(f"Unknown threshold_type: {threshold_type}")
+        
+        # Mark anomalies
+        anomaly_df[anomaly_col] = anomaly_mask
+        anomaly_df[anomaly_type_col] = anomaly_mask.apply(
+            lambda x: AnomalyType.THRESHOLD_EXCEEDED.value if x else None
+        )
+    
+    return anomaly_df
+
+
+def detect_missing_data_anomalies(differences_df: pd.DataFrame, grouping_columns: List[str],
+                                numerical_columns: List[str]) -> pd.DataFrame:
+    """
+    Detect anomalies due to missing data in either dataset.
+    
+    Args:
+        differences_df: DataFrame with calculated differences
+        grouping_columns: List of grouping columns
+        numerical_columns: List of numerical columns
+        
+    Returns:
+        DataFrame with missing data anomaly flags added
+    """
+    anomaly_df = differences_df.copy()
+    
+    for col in numerical_columns:
+        original_col = f"{col}_original"
+        transformed_col = f"{col}_transformed"
+        missing_anomaly_col = f"{col}_missing_anomaly"
+        missing_type_col = f"{col}_missing_type"
+        
+        # Check for missing data patterns
+        original_missing = anomaly_df[original_col].isna() | (anomaly_df[original_col] == 0)
+        transformed_missing = anomaly_df[transformed_col].isna() | (anomaly_df[transformed_col] == 0)
+        
+        # Only flag as missing anomaly if one side has data and other doesn't
+        missing_in_original = (~original_missing) & transformed_missing
+        missing_in_transformed = original_missing & (~transformed_missing)
+        
+        anomaly_df[missing_anomaly_col] = missing_in_original | missing_in_transformed
+        
+        # Set anomaly types
+        anomaly_df[missing_type_col] = None
+        anomaly_df.loc[missing_in_original, missing_type_col] = AnomalyType.MISSING_IN_ORIGINAL.value
+        anomaly_df.loc[missing_in_transformed, missing_type_col] = AnomalyType.MISSING_IN_TRANSFORMED.value
+    
+    return anomaly_df
+
+
+def create_anomaly_report(anomaly_df: pd.DataFrame, grouping_columns: List[str],
+                         numerical_columns: List[str], threshold: float) -> pd.DataFrame:
+    """
+    Create a comprehensive anomaly report.
+    
+    Args:
+        anomaly_df: DataFrame with anomaly detection results
+        grouping_columns: List of grouping columns
+        numerical_columns: List of numerical columns
+        threshold: Threshold used for anomaly detection
+        
+    Returns:
+        Clean anomaly report DataFrame
+    """
+    report_rows = []
+    
+    for _, row in anomaly_df.iterrows():
+        # Extract group keys
+        group_keys = {col: row[col] for col in grouping_columns}
+        
+        for col in numerical_columns:
+            original_val = row[f"{col}_original"]
+            transformed_val = row[f"{col}_transformed"]
+            difference = row[f"{col}_difference"]
+            abs_difference = row[f"{col}_abs_difference"]
+            
+            # Check for any anomaly
+            threshold_anomaly = row.get(f"{col}_anomaly", False)
+            missing_anomaly = row.get(f"{col}_missing_anomaly", False)
+            
+            is_anomaly = threshold_anomaly or missing_anomaly
+            
+            # Determine anomaly type
+            anomaly_type = None
+            if threshold_anomaly:
+                anomaly_type = row.get(f"{col}_anomaly_type")
+            elif missing_anomaly:
+                anomaly_type = row.get(f"{col}_missing_type")
+            
+            # Create report row
+            report_row = {
+                **group_keys,
+                'numerical_column': col,
+                'original_value': original_val,
+                'transformed_value': transformed_val,
+                'difference': difference,
+                'abs_difference': abs_difference,
+                'is_anomaly': is_anomaly,
+                'anomaly_type': anomaly_type,
+                'threshold': threshold if threshold_anomaly else None
+            }
+            
+            report_rows.append(report_row)
+    
+    return pd.DataFrame(report_rows)
+
+
+def compare_and_detect_anomalies(aggregated_data: Dict, threshold: float = 10.0,
+                                threshold_type: str = 'absolute') -> Dict[str, Union[pd.DataFrame, Dict]]:
+    """
+    Main function to compare aggregated datasets and detect anomalies.
+    
+    Args:
+        aggregated_data: Dictionary containing aggregated datasets from data_aggregator
+        threshold: Threshold value for anomaly detection
+        threshold_type: Type of threshold ('absolute' or 'percentage')
+        
+    Returns:
+        Dictionary containing anomaly detection results and summary
+    """
+    original_agg = aggregated_data['original']
+    transformed_agg = aggregated_data['transformed']
+    grouping_columns = aggregated_data['grouping_columns']
+    numerical_columns = aggregated_data['numerical_columns']
+    
+    # Calculate differences
+    differences_df = calculate_differences(
+        original_agg, transformed_agg, grouping_columns, numerical_columns
+    )
+    
+    # Detect threshold-based anomalies
+    anomaly_df = detect_threshold_anomalies(
+        differences_df, numerical_columns, threshold, threshold_type
+    )
+    
+    # Detect missing data anomalies
+    anomaly_df = detect_missing_data_anomalies(
+        anomaly_df, grouping_columns, numerical_columns
+    )
+    
+    # Create comprehensive report
+    anomaly_report = create_anomaly_report(
+        anomaly_df, grouping_columns, numerical_columns, threshold
+    )
+    
+    # Generate summary statistics
+    summary = generate_anomaly_summary(anomaly_report, numerical_columns)
+    
+    return {
+        'anomaly_report': anomaly_report,
+        'detailed_results': anomaly_df,
+        'summary': summary,
+        'threshold': threshold,
+        'threshold_type': threshold_type
+    }
+
+
+def generate_anomaly_summary(anomaly_report: pd.DataFrame, numerical_columns: List[str]) -> Dict:
+    """
+    Generate summary statistics for anomaly detection results.
+    
+    Args:
+        anomaly_report: Anomaly report DataFrame
+        numerical_columns: List of numerical columns
+        
+    Returns:
+        Summary dictionary with anomaly statistics
+    """
+    total_comparisons = len(anomaly_report)
+    total_anomalies = anomaly_report['is_anomaly'].sum()
+    
+    summary = {
+        'total_comparisons': total_comparisons,
+        'total_anomalies': total_anomalies,
+        'anomaly_rate': (total_anomalies / total_comparisons * 100) if total_comparisons > 0 else 0,
+        'anomalies_by_type': anomaly_report['anomaly_type'].value_counts().to_dict(),
+        'anomalies_by_column': {},
+        'largest_differences': {}
+    }
+    
+    # Anomalies by numerical column
+    for col in numerical_columns:
+        col_anomalies = anomaly_report[
+            (anomaly_report['numerical_column'] == col) & (anomaly_report['is_anomaly'] == True)
+        ]
+        summary['anomalies_by_column'][col] = len(col_anomalies)
+        
+        # Largest differences for this column
+        if not col_anomalies.empty:
+            max_diff_row = col_anomalies.loc[col_anomalies['abs_difference'].idxmax()]
+            summary['largest_differences'][col] = {
+                'abs_difference': max_diff_row['abs_difference'],
+                'group_keys': {k: v for k, v in max_diff_row.items() if k in anomaly_report.columns and k.startswith('group_') or k in ['category', 'region', 'product']}
+            }
+    
+    return summary
+
+
+def filter_anomalies(anomaly_report: pd.DataFrame, filters: Dict = None) -> pd.DataFrame:
+    """
+    Filter anomaly report based on specified criteria.
+    
+    Args:
+        anomaly_report: Anomaly report DataFrame
+        filters: Dictionary of filter criteria
+        
+    Returns:
+        Filtered anomaly report DataFrame
+    """
+    filtered_df = anomaly_report.copy()
+    
+    if filters:
+        # Filter by anomaly status
+        if 'only_anomalies' in filters and filters['only_anomalies']:
+            filtered_df = filtered_df[filtered_df['is_anomaly'] == True]
+        
+        # Filter by minimum difference
+        if 'min_difference' in filters:
+            filtered_df = filtered_df[filtered_df['abs_difference'] >= filters['min_difference']]
+        
+        # Filter by numerical column
+        if 'numerical_columns' in filters:
+            filtered_df = filtered_df[filtered_df['numerical_column'].isin(filters['numerical_columns'])]
+        
+        # Filter by anomaly type
+        if 'anomaly_types' in filters:
+            filtered_df = filtered_df[filtered_df['anomaly_type'].isin(filters['anomaly_types'])]
+    
+    return filtered_df
