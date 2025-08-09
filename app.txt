@@ -1,58 +1,53 @@
 import io
 import msoffcrypto
-from openpyxl import load_workbook
+from pyxlsb import open_workbook
+import pandas as pd
 
-def read_double_protected_excel(file_path, open_password, write_password=None):
+def read_protected_xlsb(file_bytes, open_password, write_password=None):
     """
-    Read an Excel file with both open and write protection
+    Read a password-protected XLSB file with potential write protection
     
     Args:
-        file_path: Path to the Excel file
+        file_bytes: Binary content of the XLSB file
         open_password: Password to open the file
-        write_password: Password to remove write protection (optional)
+        write_password: Password for write protection (if exists)
     
     Returns:
         Dictionary of {sheet_name: pandas DataFrame}
     """
-    # Read the encrypted file
-    with open(file_path, 'rb') as f:
-        encrypted = io.BytesIO(f.read())
-    
-    # First decryption - open password
+    # First decrypt the file (open password)
     decrypted = io.BytesIO()
     try:
-        office_file = msoffcrypto.OfficeFile(encrypted)
+        office_file = msoffcrypto.OfficeFile(io.BytesIO(file_bytes))
         office_file.load_key(password=open_password)
         office_file.decrypt(decrypted)
         decrypted.seek(0)
     except Exception as e:
         raise ValueError(f"Failed to decrypt with open password: {str(e)}")
     
-    # Handle write protection using openpyxl
+    # Handle XLSB format
     try:
-        wb = load_workbook(decrypted)
-        
-        # If workbook is write-protected and password is provided
-        if wb.security.lockStructure and write_password:
-            wb.security.workbookPassword = write_password
-            wb.security.lockStructure = False
-        
-        # Convert to pandas DataFrames
         result = {}
-        for sheet_name in wb.sheetnames:
-            sheet = wb[sheet_name]
-            data = sheet.values
-            cols = next(data)
-            result[sheet_name] = pd.DataFrame(data, columns=cols)
+        with open_workbook(decrypted) as wb:
+            for sheet_name in wb.sheets:
+                with wb.get_sheet(sheet_name) as sheet:
+                    # Read all data into a list of lists
+                    data = []
+                    for row in sheet.rows():
+                        data.append([item.v for item in row])
+                    
+                    # Convert to DataFrame
+                    if data:
+                        cols = data[0]
+                        rows = data[1:]
+                        result[sheet_name] = pd.DataFrame(rows, columns=cols)
         
         return result
     
     except Exception as e:
-        raise ValueError(f"Failed to handle write protection: {str(e)}")
+        raise ValueError(f"Failed to read XLSB content: {str(e)}")
 
 # Example usage:
-# data = read_double_protected_excel(
-#     'double_protected.xlsx',
-#     open_password='open123',
-#     write_password='edit456'
-# )
+# with open('protected.xlsb', 'rb') as f:
+#     file_bytes = f.read()
+# data = read_protected_xlsb(file_bytes, 'open123', 'edit456')
