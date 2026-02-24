@@ -1,53 +1,942 @@
-import io
-import msoffcrypto
-from pyxlsb import open_workbook
+import dash
+from dash import dcc, html, Input, Output, State, dash_table, callback_context, ALL
+from dash.exceptions import PreventUpdate
+import dash_bootstrap_components as dbc
 import pandas as pd
+import base64
+import io
+import os
+import numpy as np
+import json
+import logging
+from datetime import datetime
+import uuid
+from io import BytesIO
+import webbrowser
+from threading import Timer
+import time
+import openpyxl
+import difflib
 
-def read_protected_xlsb(file_bytes, open_password, write_password=None):
-    """
-    Read a password-protected XLSB file with potential write protection
-    
-    Args:
-        file_bytes: Binary content of the XLSB file
-        open_password: Password to open the file
-        write_password: Password for write protection (if exists)
-    
-    Returns:
-        Dictionary of {sheet_name: pandas DataFrame}
-    """
-    # First decrypt the file (open password)
-    decrypted = io.BytesIO()
-    try:
-        office_file = msoffcrypto.OfficeFile(io.BytesIO(file_bytes))
-        office_file.load_key(password=open_password)
-        office_file.decrypt(decrypted)
-        decrypted.seek(0)
-    except Exception as e:
-        raise ValueError(f"Failed to decrypt with open password: {str(e)}")
-    
-    # Handle XLSB format
-    try:
-        result = {}
-        with open_workbook(decrypted) as wb:
-            for sheet_name in wb.sheets:
-                with wb.get_sheet(sheet_name) as sheet:
-                    # Read all data into a list of lists
-                    data = []
-                    for row in sheet.rows():
-                        data.append([item.v for item in row])
-                    
-                    # Convert to DataFrame
-                    if data:
-                        cols = data[0]
-                        rows = data[1:]
-                        result[sheet_name] = pd.DataFrame(rows, columns=cols)
-        
-        return result
-    
-    except Exception as e:
-        raise ValueError(f"Failed to read XLSB content: {str(e)}")
+# ── Configuration ──────────────────────────────────────────────────────────────
+team_name = "Team Analytics Avengers"
+MAX_PREVIEW_ROWS = 10
+MAX_HEADER_SCAN = 20
+MAX_RESULT_ROWS = 100
+port = 8078
 
-# Example usage:
-# with open('protected.xlsb', 'rb') as f:
-#     file_bytes = f.read()
-# data = read_protected_xlsb(file_bytes, 'open123', 'edit456')
+# ── Global State (avoids slow JSON serialization for large files) ──────────────
+app_state = {
+    'original_raw': None, 'transformed_raw': None,
+    'original_df': None, 'transformed_df': None,
+    'original_filename': None, 'transformed_filename': None,
+    'original_col_types': {}, 'transformed_col_types': {},
+}
+
+logging.basicConfig(filename='app.log', level=logging.DEBUG,
+                    format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# ── Helper Functions ───────────────────────────────────────────────────────────
+
+def open_browser():
+    webbrowser.open_new(f"http://localhost:{port}")
+
+def mylogo():
+    return html.Img(src=dash.get_asset_url("hsbc_logo.png"), alt="HSBC",
+                    style={"height": "3.3em", 'float': 'left', 'display': 'inline'})
+
+def detect_header_row(raw_bytes, filename):
+    """Scan first N rows to find the actual header row (skipping metadata)."""
+    try:
+        if filename.endswith('.csv'):
+            df_raw = pd.read_csv(io.StringIO(raw_bytes.decode('utf-8')),
+                                 header=None, nrows=MAX_HEADER_SCAN)
+        else:
+            df_raw = pd.read_excel(BytesIO(raw_bytes), header=None,
+                                   nrows=MAX_HEADER_SCAN)
+    except Exception:
+        return 0
+
+    n_cols = len(df_raw.columns)
+    best_row, best_score = 0, -1
+
+    for i in range(min(MAX_HEADER_SCAN, len(df_raw))):
+        row = df_raw.iloc[i]
+        non_null = row.dropna()
+        if len(non_null) == 0:
+            continue
+        score = 0
+        # Completeness – headers fill most cells
+        score += (len(non_null) / n_cols) * 25
+        # Uniqueness – header values should be unique
+        unique_ratio = len(set(str(v).strip().lower() for v in non_null)) / len(non_null)
+        score += unique_ratio * 25
+        # String content – headers are typically text, not pure numbers
+        str_count = sum(1 for v in non_null
+                        if not str(v).strip().replace('.', '').replace('-', '').replace(',', '').isdigit())
+        score += (str_count / len(non_null)) * 25
+        # Data consistency below header – rows below should have more numbers
+        if i + 1 < len(df_raw):
+            below = df_raw.iloc[i + 1]
+            below_nn = below.dropna()
+            if len(below_nn) > 0:
+                num_count = sum(1 for v in below_nn
+                                if str(v).strip().replace('.', '').replace('-', '').replace(',', '').replace(' ', '').isdigit()
+                                or isinstance(v, (int, float)))
+                if str_count > len(non_null) * 0.4 and num_count > 0:
+                    score += 25
+        if score > best_score:
+            best_score = score
+            best_row = i
+    return best_row
+
+def parse_file(raw_bytes, filename, header_row=0):
+    """Parse uploaded file bytes into a DataFrame with given header row."""
+    try:
+        if filename.endswith('.csv'):
+            df = pd.read_csv(io.StringIO(raw_bytes.decode('utf-8')),
+                             header=header_row)
+        elif any(filename.endswith(ext) for ext in ['.xls', '.xlsx', '.xlsm', '.xlsb']):
+            df = pd.read_excel(BytesIO(raw_bytes), header=header_row)
+        else:
+            return None
+        df.columns = df.columns.astype(str).str.strip()
+        logger.info(f"Parsed {filename} (header={header_row}): {df.shape}")
+        return df
+    except Exception as e:
+        logger.error(f"Error parsing {filename}: {e}")
+        return None
+
+def auto_detect_column_types(df):
+    """Classify each column as numerical, categorical, or date."""
+    col_types = {}
+    for col in df.columns:
+        series = df[col].dropna()
+        if len(series) == 0:
+            col_types[col] = 'categorical'
+            continue
+        # Already numeric dtype?
+        if pd.api.types.is_numeric_dtype(df[col]):
+            col_types[col] = 'numerical'
+            continue
+        # Try numeric conversion
+        numeric = pd.to_numeric(series, errors='coerce')
+        if numeric.notna().sum() / len(series) > 0.5:
+            col_types[col] = 'numerical'
+            continue
+        # Try date
+        try:
+            dates = pd.to_datetime(series, errors='coerce', infer_datetime_format=True)
+            if dates.notna().sum() / len(series) > 0.5:
+                col_types[col] = 'date'
+                continue
+        except Exception:
+            pass
+        col_types[col] = 'categorical'
+    return col_types
+
+def apply_detected_types(df, col_types):
+    """Convert DataFrame columns to their detected types for accurate analysis."""
+    df = df.copy()
+    for col, ctype in col_types.items():
+        if col not in df.columns:
+            continue
+        if ctype == 'numerical':
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        elif ctype == 'date':
+            df[col] = pd.to_datetime(df[col], errors='coerce', infer_datetime_format=True)
+    return df
+
+def col_name_similarity(a, b):
+    """Normalized name similarity using SequenceMatcher."""
+    return difflib.SequenceMatcher(None, a.lower().strip(), b.lower().strip()).ratio()
+
+def jaccard_similarity(set1, set2):
+    if len(set1) == 0 and len(set2) == 0:
+        return 1.0
+    inter = len(set1 & set2)
+    union = len(set1 | set2)
+    return inter / union if union > 0 else 0
+
+def categorical_composite_score(src_col, tgt_col, src_name, tgt_name):
+    """Composite similarity for categorical columns."""
+    name_sim = col_name_similarity(src_name, tgt_name)
+    src_vals = set(src_col.dropna().astype(str))
+    tgt_vals = set(tgt_col.dropna().astype(str))
+    value_sim = jaccard_similarity(src_vals, tgt_vals)
+    # Cardinality
+    src_card = max(len(src_vals), 1)
+    tgt_card = max(len(tgt_vals), 1)
+    card_sim = 1 - abs(src_card - tgt_card) / max(src_card, tgt_card)
+    # Null pattern
+    src_null = src_col.isna().mean()
+    tgt_null = tgt_col.isna().mean()
+    null_sim = 1 - abs(src_null - tgt_null)
+    return name_sim * 0.30 + value_sim * 0.40 + card_sim * 0.15 + null_sim * 0.15
+
+def numerical_composite_score(src_series, tgt_series, src_name='', tgt_name=''):
+    """Composite similarity for numerical columns."""
+    name_sim = col_name_similarity(src_name, tgt_name) if src_name and tgt_name else 0
+    src_clean = pd.to_numeric(src_series, errors='coerce').dropna()
+    tgt_clean = pd.to_numeric(tgt_series, errors='coerce').dropna()
+    if len(src_clean) == 0 or len(tgt_clean) == 0:
+        return name_sim * 0.25
+    stats = []
+    # Correlation
+    try:
+        min_len = min(len(src_clean), len(tgt_clean))
+        if min_len > 1:
+            corr = np.corrcoef(src_clean.iloc[:min_len], tgt_clean.iloc[:min_len])[0, 1]
+            if not np.isnan(corr):
+                stats.append(abs(corr))
+    except Exception:
+        pass
+    # Mean/std similarity
+    try:
+        s_mean, t_mean = src_clean.mean(), tgt_clean.mean()
+        data_range = max(abs(s_mean), abs(t_mean), 1e-10)
+        mean_sim = max(0, 1 - abs(s_mean - t_mean) / data_range)
+        s_std, t_std = src_clean.std(), tgt_clean.std()
+        max_std = max(s_std, t_std, 1e-10)
+        std_sim = max(0, 1 - abs(s_std - t_std) / max_std)
+        stats.append((mean_sim + std_sim) / 2)
+    except Exception:
+        pass
+    # Scale/magnitude
+    try:
+        s_log = np.log10(max(abs(s_mean), 1e-10))
+        t_log = np.log10(max(abs(t_mean), 1e-10))
+        mag_sim = max(0, 1 - abs(s_log - t_log) / max(abs(s_log), abs(t_log), 1))
+        stats.append(mag_sim)
+    except Exception:
+        pass
+    stat_score = np.mean(stats) if stats else 0
+    return name_sim * 0.25 + stat_score * 0.65 + 0.10  # 0.10 type-match bonus
+
+def find_matching_columns(source_col, target_df, column_type, col_name='',
+                          cat_threshold=0.1, num_threshold=0.2, col_types=None):
+    """Find best matching columns in target_df for a source column."""
+    matches = []
+    if column_type == 'categorical':
+        tgt_cols = [c for c, t in (col_types or {}).items() if t == 'categorical'] \
+                   or target_df.select_dtypes(include=['object', 'category']).columns.tolist()
+        for tc in tgt_cols:
+            score = categorical_composite_score(source_col, target_df[tc], col_name, tc)
+            if score >= cat_threshold:
+                matches.append((tc, score))
+    else:
+        tgt_cols = [c for c, t in (col_types or {}).items() if t == 'numerical'] \
+                   or target_df.select_dtypes(include=[np.number]).columns.tolist()
+        for tc in tgt_cols:
+            score = numerical_composite_score(source_col, target_df[tc], col_name, tc)
+            if score >= num_threshold:
+                matches.append((tc, score))
+    matches.sort(key=lambda x: x[1], reverse=True)
+    return matches
+
+def build_summary_cards(orig_df, trans_df, orig_types, trans_types, orig_name, trans_name):
+    """Build dataset summary comparison cards."""
+    def stats_card(df, types, name):
+        if df is None:
+            return dbc.Col(dbc.Card(dbc.CardBody("No data loaded"), color="light"), md=6)
+        n_num = sum(1 for v in types.values() if v == 'numerical')
+        n_cat = sum(1 for v in types.values() if v == 'categorical')
+        n_date = sum(1 for v in types.values() if v == 'date')
+        null_pct = df.isna().mean().mean() * 100
+        return dbc.Col(dbc.Card(dbc.CardBody([
+            html.H6(name or "Dataset", className="mb-2", style={'color': '#2c3e50'}),
+            html.P(f"Rows: {len(df):,}", className="mb-1 small"),
+            html.P(f"Columns: {len(df.columns)}", className="mb-1 small"),
+            html.P(f"Numerical: {n_num}  |  Categorical: {n_cat}  |  Date: {n_date}",
+                   className="mb-1 small"),
+            html.P(f"Null %: {null_pct:.1f}%", className="mb-0 small"),
+        ]), color="light", outline=True), md=6)
+
+    warnings = []
+    if orig_df is not None and trans_df is not None:
+        if len(orig_df) != len(trans_df):
+            warnings.append(f"⚠ Row count mismatch: Original={len(orig_df):,}, Transformed={len(trans_df):,}")
+        if len(orig_df.columns) != len(trans_df.columns):
+            warnings.append(f"⚠ Column count mismatch: Original={len(orig_df.columns)}, Transformed={len(trans_df.columns)}")
+
+    children = [dbc.Row([stats_card(orig_df, orig_types, orig_name),
+                         stats_card(trans_df, trans_types, trans_name)], className="mb-2")]
+    if warnings:
+        children.append(html.Div([html.P(w, className="mb-1 small text-warning") for w in warnings]))
+    return children
+
+def generate_excel_from_results(analysis_results, anomaly_threshold):
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        for idx, result in enumerate(analysis_results):
+            if 'comparison_data' in result:
+                df = result['comparison_data'].copy()
+                df['Status'] = np.where(df['percentage_diff'] > anomaly_threshold, 'Anomaly', 'Normal')
+                sheet = f"Analysis_{idx+1}"[:31]
+                df.to_excel(writer, sheet_name=sheet, index=False)
+    output.seek(0)
+    return output
+
+# ── App Init ───────────────────────────────────────────────────────────────────
+app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP],
+                assets_folder=f'{os.getcwd()}/assets', suppress_callback_exceptions=True)
+app.title = "Data Reconciliation Tool"
+
+# ── Layout ─────────────────────────────────────────────────────────────────────
+app.layout = html.Div([
+    # Header
+    dbc.Row([
+        dbc.Col(mylogo(), width=1),
+        dbc.Col(html.H1("Data Reconciliation Tool", style={
+            'textAlign': 'left', 'color': '#2c3e50', 'fontSize': '28px',
+            'fontWeight': '300', 'marginBottom': '5px'}), width=5),
+    ], style={'paddingTop': '15px', 'paddingBottom': '15px'}),
+
+    # ─── Upload Section ───
+    dbc.Card(dbc.CardBody([
+        html.H3("Upload Datasets", className="mb-3"),
+        dbc.Row([
+            dbc.Col([
+                html.H5("Original Dataset", className="mb-2"),
+                dcc.Upload(id='upload-original',
+                           children=html.Div(['Drag and Drop or ',
+                                html.A('Select File', style={'color': '#3498db', 'textDecoration': 'underline'})]),
+                           style={'width': '100%', 'height': '50px', 'lineHeight': '50px',
+                                  'borderWidth': '2px', 'borderStyle': 'dashed', 'borderRadius': '8px',
+                                  'textAlign': 'center', 'margin': '5px 0', 'backgroundColor': '#f8f9fa',
+                                  'borderColor': '#dee2e6', 'color': '#6c757d', 'fontSize': '14px'},
+                           multiple=False),
+                html.Div(id='original-file-info', className="text-muted small mt-2"),
+                html.Div([
+                    html.Label("Header Row:", className="small fw-bold me-2"),
+                    dcc.Input(id='original-header-select', type='number', value=0, min=0, max=50,
+                              style={'width': '70px', 'display': 'inline-block'}, debounce=True),
+                    html.Span(" (auto-detected)", id='orig-header-hint', className="text-muted small ms-1"),
+                ], className="mt-2"),
+            ], md=6),
+            dbc.Col([
+                html.H5("Transformed Dataset", className="mb-2"),
+                dcc.Upload(id='upload-transformed',
+                           children=html.Div(['Drag and Drop or ',
+                                html.A('Select File', style={'color': '#3498db', 'textDecoration': 'underline'})]),
+                           style={'width': '100%', 'height': '50px', 'lineHeight': '50px',
+                                  'borderWidth': '2px', 'borderStyle': 'dashed', 'borderRadius': '8px',
+                                  'textAlign': 'center', 'margin': '5px 0', 'backgroundColor': '#f8f9fa',
+                                  'borderColor': '#dee2e6', 'color': '#6c757d', 'fontSize': '14px'},
+                           multiple=False),
+                html.Div(id='transformed-file-info', className="text-muted small mt-2"),
+                html.Div([
+                    html.Label("Header Row:", className="small fw-bold me-2"),
+                    dcc.Input(id='transformed-header-select', type='number', value=0, min=0, max=50,
+                              style={'width': '70px', 'display': 'inline-block'}, debounce=True),
+                    html.Span(" (auto-detected)", id='trans-header-hint', className="text-muted small ms-1"),
+                ], className="mt-2"),
+            ], md=6),
+        ]),
+    ]), className="mb-4"),
+
+    # ─── Data Preview ───
+    dbc.Card(dbc.CardBody([
+        html.H5("Data Preview", className="mb-3"),
+        dbc.Row([
+            dbc.Col(html.Div(id='original-preview'), md=6),
+            dbc.Col(html.Div(id='transformed-preview'), md=6),
+        ]),
+    ]), id='preview-card', className="mb-4", style={'display': 'none'}),
+
+    # ─── Dataset Summary ───
+    html.Div(id='dataset-summary', className="mb-4"),
+
+    # ─── Column Matching ───
+    html.Div([
+        html.H3("Column Matching", className="mb-3"),
+        dbc.Card(dbc.CardBody([
+            html.H5("Matching Thresholds", className="mb-3"),
+            dbc.Row([
+                dbc.Col([
+                    html.Label("Categorical Threshold:", className="fw-bold small mb-1"),
+                    dcc.Slider(id='categorical-threshold', min=0.0, max=1.0, step=0.05, value=0.1,
+                               marks={i/4: str(i/4) for i in range(5)},
+                               tooltip={"placement": "bottom", "always_visible": True}),
+                    html.Div(id='categorical-threshold-display', className="text-muted small mt-1")
+                ], md=4),
+                dbc.Col([
+                    html.Label("Numerical Threshold:", className="fw-bold small mb-1"),
+                    dcc.Slider(id='numerical-threshold', min=0.0, max=1.0, step=0.05, value=0.2,
+                               marks={i/4: str(i/4) for i in range(5)},
+                               tooltip={"placement": "bottom", "always_visible": True}),
+                    html.Div(id='numerical-threshold-display', className="text-muted small mt-1")
+                ], md=4),
+                dbc.Col([
+                    html.Label("Anomaly Threshold (%):", className="fw-bold small mb-1",
+                               style={"color": "darkred"}),
+                    dcc.Slider(id='anomaly-threshold', min=0.0, max=100.0, step=1.0, value=10.0,
+                               marks={i*10: f'{i*10}%' for i in range(11)},
+                               tooltip={"placement": "bottom", "always_visible": True}),
+                    html.Div(id='anomaly-threshold-display', className="text-muted small mt-1")
+                ], md=4),
+            ]),
+        ]), className="mb-3"),
+        dbc.Row([
+            dbc.Col(dbc.Card(dbc.CardBody([
+                html.H4("Categorical Columns", className="mb-3"),
+                html.Label("Select Original Columns:", className="fw-bold small mb-1"),
+                dcc.Dropdown(id='categorical-source', options=[], multi=True,
+                             placeholder="Select categorical columns...", className="mb-2"),
+                html.Div(id='categorical-matches-text', className="text-muted small mb-2"),
+                html.Label("Select Transformed Columns:", className="fw-bold small mb-1"),
+                dcc.Dropdown(id='categorical-transformed', options=[], multi=True,
+                             placeholder="Select transformed columns...", className="mb-2"),
+                html.Button("Add Selected Pairs", id='add-categorical-pairs',
+                            className="btn btn-primary btn-sm mb-2"),
+                html.Div(id='categorical-pairs-table', children=[]),
+            ])), md=6),
+            dbc.Col(dbc.Card(dbc.CardBody([
+                html.H4("Numerical Columns", className="mb-3"),
+                html.Label("Select Original Columns:", className="fw-bold small mb-1"),
+                dcc.Dropdown(id='numerical-source', options=[],
+                             placeholder="Select numerical columns...", className="mb-2"),
+                html.Div(id='numerical-matches-text', className="text-muted small mb-2"),
+                html.Label("Select Transformed Columns:", className="fw-bold small mb-1"),
+                dcc.Dropdown(id='numerical-transformed', options=[],
+                             placeholder="Select transformed columns...", className="mb-2"),
+                html.Button("Add Selected Pairs", id='add-numerical-pairs',
+                            className="btn btn-success btn-sm mb-2"),
+                html.Div(id='numerical-pairs-table', children=[]),
+            ])), md=6),
+        ], className="mb-4"),
+
+        # ─── Aggregation Settings ───
+        dbc.Card(dbc.CardBody([
+            html.H5("Aggregation Settings", className="mb-3"),
+            dbc.Row([
+                dbc.Col([
+                    html.Label("Aggregation Function:", className="fw-bold small mb-1"),
+                    dcc.Dropdown(id='agg-function',
+                                 options=[{'label': f, 'value': f.lower()}
+                                          for f in ['Sum', 'Mean', 'Count', 'Min', 'Max', 'Median']],
+                                 value='sum', clearable=False, className="mb-2"),
+                ], md=6),
+                dbc.Col([
+                    html.Label("Max Display Rows:", className="fw-bold small mb-1"),
+                    dcc.Input(id='max-display-rows', type='number', value=100, min=10, max=10000,
+                              style={'width': '100%'}, debounce=True),
+                ], md=6),
+            ]),
+        ]), className="mb-4", style={'padding': '5px'}),
+
+        # Reconcile button
+        html.Div([
+            dbc.Button("Reconcile", id='display-data-btn',
+                       style={"width": "200px", "height": "40px", "background-color": "#28a745",
+                              "color": "white", "border": "none"}, className="mb-3"),
+        ], className="text-center"),
+
+        # Results area with loading spinner
+        dcc.Loading(id="loading-results", type="circle", children=[
+            html.Div(id='display-results', children=[])
+        ]),
+
+    ], id='main-selection-area', className="mb-4"),
+
+    # Stores
+    dcc.Store(id='upload-timestamp', data=0),
+    dcc.Store(id='selection-pairs', data={'categorical': [], 'numerical': []}),
+    dcc.Download(id="download-analysis"),
+
+    # Team badge
+    html.Div(f"Developed By: {team_name}", style={
+        'position': 'fixed', 'top': '10px', 'right': '10px',
+        'backgroundColor': 'lightgray', 'padding': '5px', 'borderRadius': '5px',
+        'fontSize': '14px', 'fontWeight': 'bold', 'zIndex': '1000'}),
+], className="container-fluid py-4")
+
+
+# ── Callbacks ──────────────────────────────────────────────────────────────────
+
+# 1. Handle file upload → detect header, store raw bytes, set header selector
+@app.callback(
+    [Output('original-header-select', 'value'),
+     Output('transformed-header-select', 'value'),
+     Output('upload-timestamp', 'data')],
+    [Input('upload-original', 'contents'),
+     Input('upload-transformed', 'contents')],
+    [State('upload-original', 'filename'),
+     State('upload-transformed', 'filename'),
+     State('original-header-select', 'value'),
+     State('transformed-header-select', 'value')],
+    prevent_initial_call=True)
+def handle_upload(orig_contents, trans_contents, orig_fname, trans_fname,
+                  prev_orig_header, prev_trans_header):
+    ctx = callback_context
+    triggered = ctx.triggered[0]['prop_id'] if ctx.triggered else ''
+    orig_header = dash.no_update
+    trans_header = dash.no_update
+
+    if 'upload-original' in triggered and orig_contents:
+        decoded = base64.b64decode(orig_contents.split(',')[1])
+        app_state['original_raw'] = decoded
+        app_state['original_filename'] = orig_fname
+        orig_header = detect_header_row(decoded, orig_fname)
+        logger.info(f"Upload original: {orig_fname}, detected header row: {orig_header}")
+
+    if 'upload-transformed' in triggered and trans_contents:
+        decoded = base64.b64decode(trans_contents.split(',')[1])
+        app_state['transformed_raw'] = decoded
+        app_state['transformed_filename'] = trans_fname
+        trans_header = detect_header_row(decoded, trans_fname)
+        logger.info(f"Upload transformed: {trans_fname}, detected header row: {trans_header}")
+
+    return orig_header, trans_header, time.time()
+
+
+# 2. Parse data when header changes or file uploaded
+@app.callback(
+    [Output('original-file-info', 'children'),
+     Output('transformed-file-info', 'children'),
+     Output('original-preview', 'children'),
+     Output('transformed-preview', 'children'),
+     Output('dataset-summary', 'children'),
+     Output('preview-card', 'style'),
+     Output('categorical-source', 'options'),
+     Output('numerical-source', 'options'),
+     Output('categorical-transformed', 'options'),
+     Output('numerical-transformed', 'options')],
+    [Input('original-header-select', 'value'),
+     Input('transformed-header-select', 'value'),
+     Input('upload-timestamp', 'data')],
+    prevent_initial_call=True)
+def parse_and_display(orig_header, trans_header, _ts):
+    orig_info = ""
+    trans_info = ""
+    orig_preview = ""
+    trans_preview = ""
+    cat_src_opts = []
+    num_src_opts = []
+    cat_trans_opts = []
+    num_trans_opts = []
+
+    # Parse original
+    if app_state['original_raw'] is not None:
+        orig_header = orig_header if orig_header is not None else 0
+        df = parse_file(app_state['original_raw'], app_state['original_filename'], orig_header)
+        if df is not None:
+            col_types = auto_detect_column_types(df)
+            df = apply_detected_types(df, col_types)
+            app_state['original_df'] = df
+            app_state['original_col_types'] = col_types
+            orig_info = f"✔ {app_state['original_filename']} ({len(df):,} rows, {len(df.columns)} columns, header row {orig_header})"
+            cat_cols = sorted([c for c, t in col_types.items() if t == 'categorical'])
+            num_cols = sorted([c for c, t in col_types.items() if t == 'numerical'])
+            cat_src_opts = [{'label': f"🔤 {c}", 'value': c} for c in cat_cols]
+            num_src_opts = [{'label': f"🔢 {c}", 'value': c} for c in num_cols]
+            # Preview table
+            preview_df = df.head(MAX_PREVIEW_ROWS).copy()
+            for col in preview_df.columns:
+                preview_df[col] = preview_df[col].astype(str)
+            orig_preview = html.Div([
+                html.H6("Original (first 10 rows)", className="mb-2"),
+                dash_table.DataTable(
+                    data=preview_df.to_dict('records'),
+                    columns=[{'name': c, 'id': c} for c in preview_df.columns],
+                    style_table={'overflowX': 'auto', 'maxHeight': '300px', 'overflowY': 'auto'},
+                    style_cell={'textAlign': 'left', 'padding': '4px', 'fontSize': '11px',
+                                'maxWidth': '150px', 'overflow': 'hidden', 'textOverflow': 'ellipsis'},
+                    style_header={'backgroundColor': '#e9ecef', 'fontWeight': 'bold', 'fontSize': '11px'},
+                    page_size=10),
+            ])
+        else:
+            orig_info = f"✘ Error reading {app_state['original_filename']}"
+
+    # Parse transformed
+    if app_state['transformed_raw'] is not None:
+        trans_header = trans_header if trans_header is not None else 0
+        df = parse_file(app_state['transformed_raw'], app_state['transformed_filename'], trans_header)
+        if df is not None:
+            col_types = auto_detect_column_types(df)
+            df = apply_detected_types(df, col_types)
+            app_state['transformed_df'] = df
+            app_state['transformed_col_types'] = col_types
+            trans_info = f"✔ {app_state['transformed_filename']} ({len(df):,} rows, {len(df.columns)} columns, header row {trans_header})"
+            cat_cols = sorted([c for c, t in col_types.items() if t == 'categorical'])
+            num_cols = sorted([c for c, t in col_types.items() if t == 'numerical'])
+            cat_trans_opts = [{'label': f"🔤 {c}", 'value': c} for c in cat_cols]
+            num_trans_opts = [{'label': f"🔢 {c}", 'value': c} for c in num_cols]
+            preview_df = df.head(MAX_PREVIEW_ROWS).copy()
+            for col in preview_df.columns:
+                preview_df[col] = preview_df[col].astype(str)
+            trans_preview = html.Div([
+                html.H6("Transformed (first 10 rows)", className="mb-2"),
+                dash_table.DataTable(
+                    data=preview_df.to_dict('records'),
+                    columns=[{'name': c, 'id': c} for c in preview_df.columns],
+                    style_table={'overflowX': 'auto', 'maxHeight': '300px', 'overflowY': 'auto'},
+                    style_cell={'textAlign': 'left', 'padding': '4px', 'fontSize': '11px',
+                                'maxWidth': '150px', 'overflow': 'hidden', 'textOverflow': 'ellipsis'},
+                    style_header={'backgroundColor': '#e9ecef', 'fontWeight': 'bold', 'fontSize': '11px'},
+                    page_size=10),
+            ])
+        else:
+            trans_info = f"✘ Error reading {app_state['transformed_filename']}"
+
+    # Summary
+    summary = build_summary_cards(
+        app_state['original_df'], app_state['transformed_df'],
+        app_state['original_col_types'], app_state['transformed_col_types'],
+        app_state.get('original_filename', ''), app_state.get('transformed_filename', ''))
+
+    show_preview = {'display': 'block'} if (app_state['original_df'] is not None or
+                                             app_state['transformed_df'] is not None) else {'display': 'none'}
+
+    return (orig_info, trans_info, orig_preview, trans_preview, summary,
+            show_preview, cat_src_opts, num_src_opts, cat_trans_opts, num_trans_opts)
+
+
+# 3. Suggest transformed columns
+@app.callback(
+    [Output('categorical-transformed', 'value'),
+     Output('numerical-transformed', 'value')],
+    [Input('categorical-source', 'value'),
+     Input('numerical-source', 'value'),
+     Input('categorical-threshold', 'value'),
+     Input('numerical-threshold', 'value')],
+    prevent_initial_call=True)
+def suggest_columns(cat_src, num_src, cat_thresh, num_thresh):
+    orig_df = app_state.get('original_df')
+    trans_df = app_state.get('transformed_df')
+    if orig_df is None or trans_df is None:
+        return [], dash.no_update
+
+    cat_vals = []
+    if cat_src:
+        for col in cat_src:
+            if col in orig_df.columns:
+                matches = find_matching_columns(
+                    orig_df[col], trans_df, 'categorical', col,
+                    cat_threshold=cat_thresh, col_types=app_state.get('transformed_col_types', {}))
+                if col in trans_df.columns:
+                    direct_score = categorical_composite_score(
+                        orig_df[col], trans_df[col], col, col)
+                    if direct_score >= 0.8:
+                        cat_vals.append(col)
+                        continue
+                if matches:
+                    cat_vals.append(matches[0][0])
+
+    num_val = dash.no_update
+    if num_src and isinstance(num_src, str):
+        if num_src in orig_df.columns:
+            matches = find_matching_columns(
+                orig_df[num_src], trans_df, 'numerical', num_src,
+                num_threshold=num_thresh, col_types=app_state.get('transformed_col_types', {}))
+            if num_src in trans_df.columns:
+                direct_score = numerical_composite_score(
+                    orig_df[num_src], trans_df[num_src], num_src, num_src)
+                if direct_score >= 0.7:
+                    num_val = num_src
+                elif matches:
+                    num_val = matches[0][0]
+            elif matches:
+                num_val = matches[0][0]
+
+    return cat_vals, num_val
+
+
+# 4. Update selection pairs
+@app.callback(
+    [Output('categorical-pairs-table', 'children'),
+     Output('numerical-pairs-table', 'children'),
+     Output('selection-pairs', 'data')],
+    [Input('add-categorical-pairs', 'n_clicks'),
+     Input('add-numerical-pairs', 'n_clicks'),
+     Input({'type': 'remove-pair', 'index': ALL, 'category': ALL}, 'n_clicks')],
+    [State('categorical-source', 'value'),
+     State('categorical-transformed', 'value'),
+     State('numerical-source', 'value'),
+     State('numerical-transformed', 'value'),
+     State('selection-pairs', 'data')])
+def update_pairs(cat_add, num_add, remove_clicks, cat_src, cat_trans,
+                 num_src, num_trans, pairs):
+    ctx = callback_context
+    pairs = pairs or {'categorical': [], 'numerical': []}
+    cat_pairs = pairs.get('categorical', [])
+    num_pairs = pairs.get('numerical', [])
+
+    if not ctx.triggered:
+        return [], [], pairs
+
+    triggered_id = ctx.triggered[0]['prop_id'].split('.')[0]
+
+    if triggered_id == 'add-categorical-pairs':
+        if cat_src and cat_trans and len(cat_src) == len(cat_trans):
+            for s, t in zip(cat_src, cat_trans):
+                cat_pairs.append({'id': str(uuid.uuid4()), 'source': s, 'transformed': t})
+    elif triggered_id == 'add-numerical-pairs':
+        if num_src and num_trans:
+            src = num_src if isinstance(num_src, str) else num_src[0] if num_src else None
+            tgt = num_trans if isinstance(num_trans, str) else num_trans[0] if num_trans else None
+            if src and tgt:
+                num_pairs.append({'id': str(uuid.uuid4()), 'source': src, 'transformed': tgt})
+    else:
+        try:
+            btn = json.loads(triggered_id.replace("'", '"'))
+            pid, cat = btn['index'], btn['category']
+            if cat == 'categorical':
+                cat_pairs = [p for p in cat_pairs if p['id'] != pid]
+            else:
+                num_pairs = [p for p in num_pairs if p['id'] != pid]
+        except Exception:
+            pass
+
+    pairs['categorical'] = cat_pairs
+    pairs['numerical'] = num_pairs
+
+    def make_table(pair_list, category):
+        if not pair_list:
+            return html.Div(f"No {category} pairs selected.", className="text-muted small")
+        return dbc.Table([
+            html.Thead(html.Tr([html.Th("Source"), html.Th("Transformed"), html.Th("")])),
+            html.Tbody([
+                html.Tr([
+                    html.Td(p['source']), html.Td(p['transformed']),
+                    html.Td(dbc.Button("✕", id={'type': 'remove-pair', 'index': p['id'],
+                             'category': category}, color="danger", size="sm"))
+                ]) for p in pair_list
+            ])
+        ], bordered=True, hover=True, responsive=True, size="sm")
+
+    return make_table(cat_pairs, 'categorical'), make_table(num_pairs, 'numerical'), pairs
+
+
+# 5. Threshold displays
+@app.callback(Output('categorical-threshold-display', 'children'),
+              Input('categorical-threshold', 'value'))
+def cat_thresh_disp(v): return f"Current: {v:.2f}"
+
+@app.callback(Output('numerical-threshold-display', 'children'),
+              Input('numerical-threshold', 'value'))
+def num_thresh_disp(v): return f"Current: {v:.2f}"
+
+@app.callback(Output('anomaly-threshold-display', 'children'),
+              Input('anomaly-threshold', 'value'))
+def anom_thresh_disp(v): return f"Current: {v:.1f}%"
+
+
+# 6. Match hints
+@app.callback(
+    [Output('categorical-matches-text', 'children'),
+     Output('numerical-matches-text', 'children')],
+    [Input('categorical-source', 'value'),
+     Input('numerical-source', 'value')],
+    prevent_initial_call=True)
+def update_matches_text(cat_src, num_src):
+    orig_df = app_state.get('original_df')
+    trans_df = app_state.get('transformed_df')
+    if orig_df is None or trans_df is None:
+        return "", ""
+    cat_text, num_text = [], []
+    if cat_src:
+        for col in cat_src:
+            if col in orig_df.columns:
+                matches = find_matching_columns(orig_df[col], trans_df, 'categorical', col,
+                                                col_types=app_state.get('transformed_col_types', {}))
+                if matches:
+                    top = matches[:3]
+                    cat_text.append(f"'{col}' → " + ", ".join(f"{m[0]} ({m[1]:.0%})" for m in top))
+    if num_src and isinstance(num_src, str) and num_src in orig_df.columns:
+        matches = find_matching_columns(orig_df[num_src], trans_df, 'numerical', num_src,
+                                        col_types=app_state.get('transformed_col_types', {}))
+        if matches:
+            top = matches[:3]
+            num_text.append(f"'{num_src}' → " + ", ".join(f"{m[0]} ({m[1]:.0%})" for m in top))
+    cat_res = html.Div([html.P(t, className="mb-0 small") for t in cat_text]) if cat_text else ""
+    num_res = html.Div([html.P(t, className="mb-0 small") for t in num_text]) if num_text else ""
+    return cat_res, num_res
+
+
+# 7. Main reconciliation
+@app.callback(
+    Output('display-results', 'children'),
+    [Input('display-data-btn', 'n_clicks')],
+    [State('selection-pairs', 'data'),
+     State('anomaly-threshold', 'value'),
+     State('agg-function', 'value'),
+     State('max-display-rows', 'value')])
+def reconcile(n_clicks, pairs, anomaly_threshold, agg_func, max_rows):
+    if n_clicks is None:
+        raise PreventUpdate
+
+    orig_df = app_state.get('original_df')
+    trans_df = app_state.get('transformed_df')
+    if orig_df is None or trans_df is None:
+        return dbc.Alert("Please upload both datasets first.", color="warning")
+
+    t0 = time.time()
+    pairs = pairs or {'categorical': [], 'numerical': []}
+    cat_pairs = pairs.get('categorical', [])
+    num_pairs = pairs.get('numerical', [])
+    cat_orig = [p['source'] for p in cat_pairs if p['source'] in orig_df.columns]
+    cat_trans = [p['transformed'] for p in cat_pairs if p['transformed'] in trans_df.columns]
+    num_orig = [p['source'] for p in num_pairs if p['source'] in orig_df.columns]
+    num_trans = [p['transformed'] for p in num_pairs if p['transformed'] in trans_df.columns]
+
+    if not num_orig:
+        return dbc.Alert("Please add at least one numerical column pair.", color="warning")
+
+    max_rows = max_rows or MAX_RESULT_ROWS
+    agg_func = agg_func or 'sum'
+    analysis_results = []
+    warnings = []
+
+    for orig_col, trans_col in zip(num_orig, num_trans):
+        try:
+            if cat_orig and cat_trans:
+                if len(cat_orig) != len(cat_trans):
+                    warnings.append(f"Categorical pair count mismatch for {orig_col}")
+                    continue
+                og = orig_df.groupby(cat_orig)[orig_col].agg(agg_func).reset_index()
+                tg = trans_df.groupby(cat_trans)[trans_col].agg(agg_func).reset_index()
+                og.columns = [f"orig_{c}" if c != orig_col else "orig_value" for c in og.columns]
+                tg.columns = [f"trans_{c}" if c != trans_col else "trans_value" for c in tg.columns]
+                cdf = pd.merge(og, tg,
+                               left_on=[f"orig_{c}" for c in cat_orig],
+                               right_on=[f"trans_{c}" for c in cat_trans], how='outer')
+            else:
+                # No categorical grouping — compare totals
+                o_total = pd.to_numeric(orig_df[orig_col], errors='coerce').agg(agg_func)
+                t_total = pd.to_numeric(trans_df[trans_col], errors='coerce').agg(agg_func)
+                cdf = pd.DataFrame({'orig_value': [o_total], 'trans_value': [t_total]})
+
+            cdf['percentage_diff'] = np.where(
+                (cdf['orig_value'].notna()) & (cdf['trans_value'].notna()) & (cdf['orig_value'] != 0),
+                abs(cdf['orig_value'] - cdf['trans_value']) / abs(cdf['orig_value']) * 100, np.nan)
+            cdf = cdf.drop_duplicates().dropna(subset=['percentage_diff']).reset_index(drop=True)
+            anomalies = cdf[cdf['percentage_diff'] > anomaly_threshold]
+            analysis_results.append({
+                'numerical_column': f"{orig_col} → {trans_col}",
+                'mode': f'Grouped ({agg_func})',
+                'categorical_columns': " + ".join(f"{o}→{t}" for o, t in zip(cat_orig, cat_trans)) if cat_orig else 'No grouping (totals)',
+                'total_groups': len(cdf),
+                'anomalies': len(anomalies),
+                'anomaly_percentage': len(anomalies) / max(len(cdf), 1) * 100,
+                'comparison_data': cdf,
+            })
+        except Exception as e:
+            logger.error(f"Error analyzing {orig_col} → {trans_col}: {e}")
+            analysis_results.append({'numerical_column': f"{orig_col} → {trans_col}", 'error': str(e)})
+
+    elapsed = time.time() - t0
+    components = []
+
+    # Warnings
+    if warnings:
+        components.append(dbc.Alert([html.Li(w) for w in warnings], color="warning", className="mb-3"))
+
+    # Summary dashboard
+    total_groups = sum(r.get('total_groups', 0) for r in analysis_results if 'error' not in r)
+    total_anomalies = sum(r.get('anomalies', 0) for r in analysis_results if 'error' not in r)
+    match_count = total_groups - total_anomalies
+    anomaly_rate = (total_anomalies / max(total_groups, 1)) * 100
+
+    components.append(dbc.Card(dbc.CardBody([
+        html.H5("Reconciliation Summary", className="mb-3"),
+        html.P(f"⏱ Completed in {elapsed:.3f}s", className="small text-muted mb-2"),
+        dbc.Row([
+            dbc.Col(dbc.Card(dbc.CardBody([
+                html.H3(f"{total_groups:,}", className="text-primary mb-0"),
+                html.P("Total Groups", className="small mb-0")
+            ]), color="light"), md=3),
+            dbc.Col(dbc.Card(dbc.CardBody([
+                html.H3(f"{match_count:,}", className="text-success mb-0"),
+                html.P("Matches", className="small mb-0")
+            ]), color="light"), md=3),
+            dbc.Col(dbc.Card(dbc.CardBody([
+                html.H3(f"{total_anomalies:,}", className="text-danger mb-0"),
+                html.P("Anomalies", className="small mb-0")
+            ]), color="light"), md=3),
+            dbc.Col(dbc.Card(dbc.CardBody([
+                html.H3(f"{anomaly_rate:.1f}%", style={'color': '#dc3545' if anomaly_rate > 10 else '#28a745'},
+                         className="mb-0"),
+                html.P("Anomaly Rate", className="small mb-0")
+            ]), color="light"), md=3),
+        ]),
+    ]), className="mb-3"))
+
+    # Result tables
+    for result in analysis_results:
+        if 'error' in result:
+            components.append(dbc.Alert(f"Error in {result['numerical_column']}: {result['error']}",
+                                        color="danger", className="mb-3"))
+            continue
+
+        cdf = result['comparison_data']
+        cdf_display = cdf.head(max_rows).copy()
+        # Add status column
+        cdf_display['Status'] = np.where(cdf_display['percentage_diff'] > anomaly_threshold, '❌ Anomaly', '✅ Normal')
+        # Round numeric columns
+        for c in cdf_display.select_dtypes(include=[np.number]).columns:
+            cdf_display[c] = cdf_display[c].round(4)
+
+        title = f"{result['numerical_column']}  —  {result.get('mode', '')}"
+        if 'categorical_columns' in result:
+            title += f"  |  Groups: {result.get('categorical_columns', '')}"
+
+        card = dbc.Card(dbc.CardBody([
+            html.H6(title, className="mb-2"),
+            html.P(f"Showing {len(cdf_display):,} of {len(cdf):,} rows  |  "
+                   f"Anomalies: {result['anomalies']:,} / {result['total_groups']:,}  "
+                   f"({result['anomaly_percentage']:.1f}%)", className="small text-muted mb-2"),
+            dash_table.DataTable(
+                data=cdf_display.to_dict('records'),
+                columns=[{'name': c, 'id': c} for c in cdf_display.columns],
+                page_size=25, page_action='native',
+                sort_action='native', filter_action='native',
+                style_table={'overflowX': 'auto'},
+                style_cell={'textAlign': 'left', 'padding': '6px', 'fontSize': '12px'},
+                style_header={'backgroundColor': '#e9ecef', 'fontWeight': 'bold', 'fontSize': '12px'},
+                style_data_conditional=[
+                    {'if': {'filter_query': '{Status} contains "Anomaly"'},
+                     'backgroundColor': '#f8d7da', 'color': '#721c24'},
+                ],
+            ),
+        ]), className="mb-3")
+        components.append(card)
+
+    # Store results for download
+    app_state['last_results'] = analysis_results
+    app_state['last_anomaly_threshold'] = anomaly_threshold
+
+    # Download button
+    if analysis_results:
+        components.append(dbc.Card(dbc.CardBody([
+            html.H5("Download Results", className="mb-3"),
+            dbc.Button("Download Analysis Results (XLSX)", id="download-button",
+                       style={"background-color": "#28a745", "color": "white", "border": "none"},
+                       className="w-100"),
+        ]), className="mb-3"))
+
+    return components
+
+
+# 8. Download
+@app.callback(
+    Output("download-analysis", "data"),
+    Input("download-button", "n_clicks"),
+    prevent_initial_call=True)
+def download_results(n_clicks):
+    if not n_clicks:
+        raise PreventUpdate
+    results = app_state.get('last_results', [])
+    threshold = app_state.get('last_anomaly_threshold', 10)
+    if not results:
+        return None
+    output = generate_excel_from_results(results, threshold)
+    return dcc.send_bytes(output.getvalue(),
+                          f"reconciliation_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
+
+
+# ── Main ───────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    Timer(1, open_browser).start()
+    app.run(port=port)
