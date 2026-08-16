@@ -1,0 +1,92 @@
+/* export.js — download the graph as SVG or PNG. Exposes window.Exporter. */
+(function (global) {
+  'use strict';
+
+  var BG = '#ffffff';
+
+  /* A print-ready clone: full graph bounds, identity transform, no transient UI state. */
+  function buildClone(svg, layout) {
+    var clone = svg.cloneNode(true);
+    var w = Math.ceil(layout.width);
+    var h = Math.ceil(layout.height);
+
+    clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+    clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink');
+    clone.setAttribute('width', w);
+    clone.setAttribute('height', h);
+    clone.setAttribute('viewBox', '0 0 ' + w + ' ' + h);
+
+    var viewport = clone.querySelector('.viewport');
+    if (viewport) {
+      viewport.removeAttribute('transform');
+      viewport.classList.remove('has-focus');
+    }
+    Array.prototype.forEach.call(clone.querySelectorAll('.is-focus, .is-up, .is-down, .is-hit, .is-hit-active, .is-lineage'),
+      function (node) {
+        node.classList.remove('is-focus', 'is-up', 'is-down', 'is-hit', 'is-hit-active', 'is-lineage');
+      });
+    Array.prototype.forEach.call(clone.querySelectorAll('.edge-hit'), function (node) {
+      if (node.parentNode) node.parentNode.removeChild(node);
+    });
+
+    var bg = document.createElementNS(Render.NS, 'rect');
+    bg.setAttribute('x', 0);
+    bg.setAttribute('y', 0);
+    bg.setAttribute('width', w);
+    bg.setAttribute('height', h);
+    bg.setAttribute('fill', BG);
+    if (viewport) clone.insertBefore(bg, viewport);
+    else clone.appendChild(bg);
+
+    return { node: clone, width: w, height: h };
+  }
+
+  function serialize(svg, layout) {
+    var built = buildClone(svg, layout);
+    var str = new XMLSerializer().serializeToString(built.node);
+    return { text: '<?xml version="1.0" encoding="UTF-8"?>\n' + str, width: built.width, height: built.height };
+  }
+
+  function download(blob, filename) {
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(function () { URL.revokeObjectURL(url); }, 4000);
+  }
+
+  function toSVG(svg, layout, filename) {
+    var out = serialize(svg, layout);
+    download(new Blob([out.text], { type: 'image/svg+xml;charset=utf-8' }), filename || 'pipeline.svg');
+  }
+
+  function toPNG(svg, layout, filename, scale, onError) {
+    var out = serialize(svg, layout);
+    var s = scale || 2;
+    // encodeURIComponent instead of btoa: the payload can contain non-Latin-1 text.
+    var url = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(out.text);
+    var img = new Image();
+    img.onload = function () {
+      var canvas = document.createElement('canvas');
+      canvas.width = out.width * s;
+      canvas.height = out.height * s;
+      var ctx = canvas.getContext('2d');
+      ctx.fillStyle = BG;
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      canvas.toBlob(function (blob) {
+        if (!blob) { if (onError) onError(new Error('Could not encode the PNG.')); return; }
+        download(blob, filename || 'pipeline.png');
+      }, 'image/png');
+    };
+    img.onerror = function () {
+      if (onError) onError(new Error('The browser refused to rasterise the SVG. Use SVG export instead.'));
+    };
+    img.src = url;
+  }
+
+  global.Exporter = { toSVG: toSVG, toPNG: toPNG, serialize: serialize };
+})(window);
