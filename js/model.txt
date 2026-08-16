@@ -1,0 +1,331 @@
+/* model.js — parse, validate, and build the effective graph.
+   Exposes window.Model. No modules: this must work from file:// */
+(function (global) {
+  'use strict';
+
+  /* ---------- operation type palette ---------- */
+
+  var OP_TYPES = {
+    extract:   { color: '#2563eb', tint: '#eff4ff', label: 'EXTRACT' },
+    load:      { color: '#2563eb', tint: '#eff4ff', label: 'LOAD' },
+    transform: { color: '#7c3aed', tint: '#f5f0ff', label: 'TRANSFORM' },
+    map:       { color: '#7c3aed', tint: '#f5f0ff', label: 'MAP' },
+    append:    { color: '#0891b2', tint: '#ecfaff', label: 'APPEND' },
+    union:     { color: '#0891b2', tint: '#ecfaff', label: 'UNION' },
+    merge:     { color: '#c2410c', tint: '#fff2ea', label: 'MERGE' },
+    join:      { color: '#c2410c', tint: '#fff2ea', label: 'JOIN' },
+    filter:    { color: '#b45309', tint: '#fff8e8', label: 'FILTER' },
+    aggregate: { color: '#15803d', tint: '#edfaf0', label: 'AGGREGATE' },
+    group:     { color: '#15803d', tint: '#edfaf0', label: 'GROUP' },
+    pivot:     { color: '#0f766e', tint: '#e9faf7', label: 'PIVOT' },
+    sort:      { color: '#4d7c0f', tint: '#f3fae4', label: 'SORT' },
+    save:      { color: '#be123c', tint: '#fff0f3', label: 'SAVE' },
+    output:    { color: '#be123c', tint: '#fff0f3', label: 'OUTPUT' }
+  };
+  var OP_DEFAULT = { color: '#475569', tint: '#f1f5f9', label: 'STEP' };
+
+  /* Colours handed out to operation types the table above has never seen, so a
+     new type in the JSON still gets its own identity without a code change.
+     Hues are spread around the wheel and darkened per hue band, because equal
+     lightness does not mean equal contrast — yellows and greens read far paler
+     than blues, and the badge label is drawn in this colour on white. */
+  var FALLBACK_COLORS = [
+    '#b02a37', '#b1400f', '#8f5a0c', '#7a5c00',
+    '#63690b', '#4a7314', '#217a3c', '#0b7a5e',
+    '#0a7784', '#0d6f9e', '#1266b8', '#2f5fd0',
+    '#4a52d4', '#6b46d6', '#8a3fd1', '#a333c4',
+    '#b32f9e', '#bb2f78', '#b8305a', '#8c4a63',
+    '#6d5a8c', '#3f6b7a', '#5c6b3f', '#8a5a3c'
+  ];
+
+  /* Deliberately not Math.random(): a type must keep the same colour across
+     re-renders, mode toggles, exports and re-bakes, otherwise the legend is
+     meaningless and two people reading one file see different graphs. */
+  function hashString(str) {
+    var h = 0;
+    for (var i = 0; i < str.length; i++) {
+      h = (h * 31 + str.charCodeAt(i)) | 0;
+    }
+    return Math.abs(h);
+  }
+
+  /* Pastel node fill derived from the stroke colour, matching how the known
+     types pair a deep outline with a pale tint. */
+  function tintOf(hex) {
+    var n = parseInt(hex.slice(1), 16);
+    function up(v) { return Math.round(v + (255 - v) * 0.93); }
+    return 'rgb(' + up((n >> 16) & 255) + ',' + up((n >> 8) & 255) + ',' + up(n & 255) + ')';
+  }
+
+  /* Give every unknown type in this document its own slot. The hash picks the
+     preferred slot; linear probing keeps two unknown types in the same file
+     from colliding. Beyond 24 unknown types colours start repeating. */
+  function assignFallbackColors(operations) {
+    var used = Object.create(null);
+    var byType = Object.create(null);
+    var n = FALLBACK_COLORS.length;
+    operations.forEach(function (op) {
+      if (OP_TYPES[op.type] || byType[op.type]) return;
+      var start = hashString(op.type) % n;
+      var slot = start;
+      for (var i = 0; i < n; i++) {
+        var s = (start + i) % n;
+        if (!used[s]) { slot = s; break; }
+      }
+      used[slot] = true;
+      var color = FALLBACK_COLORS[slot];
+      byType[op.type] = { color: color, tint: tintOf(color), label: op.type.toUpperCase() };
+    });
+    operations.forEach(function (op) {
+      if (byType[op.type]) op.typeInfo = byType[op.type];
+    });
+  }
+
+  function typeInfo(type) {
+    var t = OP_TYPES[String(type || '').toLowerCase()];
+    if (t) return t;
+    return {
+      color: OP_DEFAULT.color,
+      tint: OP_DEFAULT.tint,
+      label: String(type || 'step').toUpperCase()
+    };
+  }
+
+  /* ---------- text measurement (canvas is exact; layout needs it up front) ---------- */
+
+  var _mctx = null;
+  function measure(text, font) {
+    if (!_mctx) _mctx = document.createElement('canvas').getContext('2d');
+    _mctx.font = font;
+    return _mctx.measureText(String(text)).width;
+  }
+
+  var FONT_STACK = '"Segoe UI", Inter, system-ui, -apple-system, sans-serif';
+  var FONT_NAME = '600 13px ' + FONT_STACK;
+  var FONT_META = '400 11px ' + FONT_STACK;
+  var FONT_OP = '600 12px ' + FONT_STACK;
+  var FONT_BADGE = '600 11.5px ' + FONT_STACK;
+
+  /* Greedy wrap with hard-split for unbreakable words, ellipsis on overflow. */
+  function wrapText(text, font, maxWidth, maxLines) {
+    var words = String(text == null ? '' : text).split(/\s+/).filter(Boolean);
+    var lines = [];
+    var cur = '';
+    for (var i = 0; i < words.length; i++) {
+      var w = words[i];
+      var probe = cur ? cur + ' ' + w : w;
+      if (measure(probe, font) <= maxWidth || !cur) {
+        // A single word wider than the line still starts here; split it below.
+        if (!cur && measure(w, font) > maxWidth) {
+          var chunk = '';
+          for (var c = 0; c < w.length; c++) {
+            if (measure(chunk + w[c], font) > maxWidth && chunk) {
+              lines.push(chunk);
+              chunk = w[c];
+              if (lines.length >= maxLines) break;
+            } else {
+              chunk += w[c];
+            }
+          }
+          cur = chunk;
+        } else {
+          cur = probe;
+        }
+      } else {
+        lines.push(cur);
+        cur = w;
+      }
+      if (lines.length >= maxLines) break;
+    }
+    if (cur && lines.length < maxLines) lines.push(cur);
+    if (!lines.length) lines.push('');
+
+    // Overflow: mark the last kept line with an ellipsis.
+    var consumed = lines.join(' ');
+    if (consumed.replace(/\s+/g, ' ').trim().length < String(text || '').replace(/\s+/g, ' ').trim().length) {
+      var last = lines[lines.length - 1];
+      while (last.length && measure(last + '…', font) > maxWidth) last = last.slice(0, -1);
+      lines[lines.length - 1] = last + '…';
+    }
+    return lines;
+  }
+
+  /* ---------- geometry constants ---------- */
+
+  var DS_W = 254;
+  var DS_PAD_X = 15;
+  var DS_ACCENT = 5;
+  var DS_LINE_H = 17;
+  var OP_H = 56;
+  var OP_MIN_W = 156;
+  var OP_MAX_W = 250;
+
+  /* ---------- parse ---------- */
+
+  function toArray(v) {
+    if (v == null || v === '') return [];
+    return Array.isArray(v) ? v.slice() : [v];
+  }
+
+  function parse(raw) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      throw new Error('Top-level JSON must be an object with "datasets" and "operations".');
+    }
+    var warnings = [];
+    var dsList = Array.isArray(raw.datasets) ? raw.datasets : [];
+    var opList = Array.isArray(raw.operations) ? raw.operations : [];
+    if (!dsList.length) warnings.push('No "datasets" array found in the JSON.');
+    if (!opList.length) warnings.push('No "operations" array found in the JSON.');
+
+    var datasets = Object.create(null);
+    var dsOrder = [];
+
+    function addDataset(d, i) {
+      var id = d && d.id != null ? String(d.id) : 'dataset_' + i;
+      if (datasets[id]) {
+        warnings.push('Duplicate dataset id "' + id + '" — keeping the first definition.');
+        return;
+      }
+      datasets[id] = {
+        id: id,
+        name: d && d.name != null ? String(d.name) : id,
+        description: d && d.description != null ? String(d.description) : '',
+        tags: toArray(d && d.tags).map(String),
+        columns: toArray(d && d.columns).map(String),
+        missing: false
+      };
+      dsOrder.push(id);
+    }
+    dsList.forEach(addDataset);
+
+    function ensure(id, opId) {
+      if (datasets[id]) return datasets[id];
+      datasets[id] = {
+        id: id,
+        name: id,
+        description: 'This dataset id is referenced by an operation but never defined in "datasets".',
+        tags: [],
+        columns: [],
+        missing: true
+      };
+      dsOrder.push(id);
+      warnings.push('Operation "' + opId + '" references unknown dataset id "' + id + '".');
+      return datasets[id];
+    }
+
+    var operations = [];
+    var opById = Object.create(null);
+    opList.forEach(function (o, i) {
+      var id = o && o.id != null ? String(o.id) : 'operation_' + i;
+      if (opById[id]) {
+        warnings.push('Duplicate operation id "' + id + '" — keeping the first definition.');
+        return;
+      }
+      var type = o && o.type != null ? String(o.type).toLowerCase() : 'transform';
+      var from = toArray(o && o.from).map(String);
+      var to = toArray(o && o.to).map(String);
+      if (!from.length) warnings.push('Operation "' + id + '" has no "from" inputs.');
+      if (!to.length) warnings.push('Operation "' + id + '" has no "to" output.');
+      from.forEach(function (f) { ensure(f, id); });
+      to.forEach(function (t) { ensure(t, id); });
+
+      var op = {
+        id: id,
+        name: o && o.name != null ? String(o.name) : id,
+        type: type,
+        typeInfo: typeInfo(type),
+        from: from,
+        to: to,
+        detail: o && o.detail != null ? String(o.detail) : ''
+      };
+      operations.push(op);
+      opById[id] = op;
+    });
+
+    assignFallbackColors(operations);
+
+    return {
+      title: raw.title != null ? String(raw.title) : 'Data pipeline',
+      datasets: datasets,
+      datasetOrder: dsOrder,
+      operations: operations,
+      opById: opById,
+      warnings: warnings
+    };
+  }
+
+  /* ---------- node construction ---------- */
+
+  function datasetNode(ds) {
+    var textW = DS_W - DS_PAD_X * 2 - DS_ACCENT;
+    var lines = wrapText(ds.name, FONT_NAME, textW, 2);
+    var metaBits = [];
+    if (ds.tags.length) metaBits.push(ds.tags.join(' · '));
+    metaBits.push(ds.columns.length + (ds.columns.length === 1 ? ' column' : ' columns'));
+    var meta = metaBits.join('  •  ');
+    var metaLines = wrapText(meta, FONT_META, textW, 1);
+    var h = 13 + lines.length * DS_LINE_H + 7 + 13 + 12;
+    return {
+      id: ds.id,
+      kind: ds.missing ? 'missing' : 'dataset',
+      w: DS_W,
+      h: h,
+      lines: lines,
+      meta: metaLines[0],
+      data: ds
+    };
+  }
+
+  function opNode(op) {
+    var lines = wrapText(op.name, FONT_OP, OP_MAX_W - 32, 2);
+    var widest = 0;
+    lines.forEach(function (l) { widest = Math.max(widest, measure(l, FONT_OP)); });
+    widest = Math.max(widest, measure(op.typeInfo.label, FONT_META) + 6);
+    var w = Math.min(OP_MAX_W, Math.max(OP_MIN_W, Math.ceil(widest) + 32));
+    return {
+      id: 'op:' + op.id,
+      kind: 'op',
+      w: w,
+      h: lines.length > 1 ? OP_H + 15 : OP_H,
+      lines: lines,
+      data: op
+    };
+  }
+
+  /* ---------- effective graph ---------- */
+
+  function buildGraph(parsed, mode) {
+    var compact = mode !== 'explicit';
+    var nodes = [];
+    var byId = Object.create(null);
+    var edges = [];
+
+    parsed.datasetOrder.forEach(function (id) {
+      var n = datasetNode(parsed.datasets[id]);
+      nodes.push(n);
+      byId[n.id] = n;
+    });
+
+    var eid = 0;
+    function addEdge(from, to, op) {
+      if (!byId[from] || !byId[to]) return;
+      edges.push({ id: 'e' + (eid++), from: from, to: to, op: op || null, t: 0.5 });
+    }
+
+    parsed.operations.forEach(function (op) {
+      var collapsible = compact && op.from.length === 1 && op.to.length === 1;
+      if (collapsible) {
+        addEdge(op.from[0], op.to[0], op);
+        return;
+      }
+      var n = opNode(op);
+      nodes.push(n);
+      byId[n.id] = n;
+      op.from.forEach(function (f) { addEdge(f, n.id, null); });
+      op.to.forEach(function (t) { addEdge(n.id, t, null); });
+    });
+
+    /* Parallel badged edges between the same pair would stack; fan their labels out. */
+    var pairs = Object.create(null);
+    edges.forEach(function (e) {
+      var k = e.from + '
