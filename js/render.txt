@@ -1,0 +1,229 @@
+/* render.js — build the SVG for a computed layout. Exposes window.Render.
+   All graph styling lives in a <style> inside the <svg> so that serialising the
+   node for SVG/PNG export produces a self-contained, correctly styled file. */
+(function (global) {
+  'use strict';
+
+  var NS = 'http://www.w3.org/2000/svg';
+
+  var ROLE_COLOR = {
+    source: '#0f766e',
+    intermediate: '#94a3b8',
+    output: '#be123c',
+    missing: '#dc2626'
+  };
+
+  var GRAPH_CSS = [
+    '.graph-root { font-family: ' + Model.FONT_STACK + '; }',
+    '.node { cursor: pointer; }',
+    '.node-bg { fill: #ffffff; stroke: #d8dee9; stroke-width: 1.25; }',
+    '.node.role-source .node-bg { stroke: #99cfc9; }',
+    '.node.role-output .node-bg { stroke: #f0adbd; }',
+    '.node.kind-missing .node-bg { stroke: #dc2626; stroke-dasharray: 5 3; fill: #fff5f5; }',
+    '.node:hover .node-bg { stroke: #475569; }',
+    '.node-name { font: ' + Model.FONT_NAME + '; fill: #0f172a; }',
+    '.node-meta { font: ' + Model.FONT_META + '; fill: #64748b; }',
+    '.node-role { font: 600 9.5px ' + Model.FONT_STACK + '; letter-spacing: .7px; }',
+    '.op-bg { stroke-width: 1.5; }',
+    '.op-type { font: 600 9.5px ' + Model.FONT_STACK + '; letter-spacing: .9px; }',
+    '.op-name { font: ' + Model.FONT_OP + '; fill: #0f172a; }',
+    '.edge-line { fill: none; stroke-width: 1.6; }',
+    '.edge-hit { fill: none; stroke: transparent; stroke-width: 16; cursor: pointer; }',
+    '.edge.is-back .edge-line { stroke-dasharray: 6 4; }',
+    '.badge { cursor: pointer; }',
+    '.badge-bg { fill: #ffffff; stroke-width: 1.5; }',
+    '.badge-text { font: ' + Model.FONT_BADGE + '; }',
+    '.badge:hover .badge-bg { fill: #f8fafc; }',
+    /* lineage focus */
+    '.has-focus .node, .has-focus .edge, .has-focus .badge { opacity: .13; }',
+    '.has-focus .node.is-focus, .has-focus .node.is-up, .has-focus .node.is-down,',
+    '.has-focus .edge.is-lineage, .has-focus .badge.is-lineage { opacity: 1; }',
+    '.node.is-focus .node-bg, .node.is-focus .op-bg { stroke: #1d4ed8; stroke-width: 2.5; }',
+    '.edge.is-lineage .edge-line { stroke-width: 2.4; }',
+    /* search */
+    '.node.is-hit .node-bg, .node.is-hit .op-bg { stroke: #d97706; stroke-width: 2.5; }',
+    '.node.is-hit-active .node-bg, .node.is-hit-active .op-bg { stroke: #d97706; stroke-width: 3.5; }',
+    '.has-focus .node.is-hit { opacity: 1; }'
+  ].join('\n');
+
+  function el(name, attrs, parent) {
+    var node = document.createElementNS(NS, name);
+    if (attrs) {
+      Object.keys(attrs).forEach(function (k) {
+        if (attrs[k] != null) node.setAttribute(k, attrs[k]);
+      });
+    }
+    if (parent) parent.appendChild(node);
+    return node;
+  }
+
+  function text(parent, str, attrs) {
+    var t = el('text', attrs, parent);
+    t.textContent = str;
+    return t;
+  }
+
+  function tooltip(parent, str) {
+    if (!str) return;
+    var t = el('title', null, parent);
+    t.textContent = str;
+  }
+
+  /* Smooth vertical path through the polyline. Collinear points stay straight. */
+  function edgePath(points) {
+    if (!points || points.length < 2) return '';
+    var d = 'M ' + points[0].x.toFixed(2) + ' ' + points[0].y.toFixed(2);
+    for (var i = 1; i < points.length; i++) {
+      var a = points[i - 1];
+      var b = points[i];
+      var k = (b.y - a.y) / 2;
+      d += ' C ' + a.x.toFixed(2) + ' ' + (a.y + k).toFixed(2) +
+           ', ' + b.x.toFixed(2) + ' ' + (b.y - k).toFixed(2) +
+           ', ' + b.x.toFixed(2) + ' ' + b.y.toFixed(2);
+    }
+    return d;
+  }
+
+  function draw(svg, layout, handlers) {
+    while (svg.firstChild) svg.removeChild(svg.firstChild);
+    svg.setAttribute('class', 'graph-root');
+
+    var style = el('style', null, svg);
+    style.textContent = GRAPH_CSS;
+
+    var defs = el('defs', null, svg);
+    var markers = Object.create(null);
+    var markerSeq = 0;
+    function markerFor(color) {
+      if (markers[color]) return markers[color];
+      var id = 'arrow-' + (markerSeq++);
+      var m = el('marker', {
+        id: id, viewBox: '0 0 10 10', refX: 9, refY: 5,
+        markerWidth: 7, markerHeight: 7, orient: 'auto-start-reverse'
+      }, defs);
+      el('path', { d: 'M 0 0 L 10 5 L 0 10 z', fill: color }, m);
+      markers[color] = id;
+      return id;
+    }
+
+    var viewport = el('g', { class: 'viewport' }, svg);
+    var edgeLayer = el('g', { class: 'edges' }, viewport);
+    var badgeLayer = el('g', { class: 'badges' }, viewport);
+    var nodeLayer = el('g', { class: 'nodes' }, viewport);
+
+    var graph = layout.graph;
+    var refs = { nodes: Object.create(null), edges: Object.create(null), badges: Object.create(null), viewport: viewport };
+
+    /* ---------- edges ---------- */
+    graph.edges.forEach(function (e) {
+      var color = e.op ? e.op.typeInfo.color : '#94a3b8';
+      var g = el('g', { class: 'edge' + (e.back ? ' is-back' : ''), 'data-edge': e.id }, edgeLayer);
+      var d = edgePath(e.points);
+      el('path', { class: 'edge-hit', d: d }, g);
+      el('path', {
+        class: 'edge-line', d: d, stroke: color,
+        'marker-end': 'url(#' + markerFor(color) + ')'
+      }, g);
+      refs.edges[e.id] = g;
+
+      if (e.op && e.labelPoint) {
+        var label = e.op.name;
+        var tw = Model.measure(label, Model.FONT_BADGE);
+        var bw = Math.ceil(tw) + 32;
+        var bh = 26;
+        var bg = el('g', {
+          class: 'badge', 'data-op': e.op.id,
+          transform: 'translate(' + (e.labelPoint.x - bw / 2).toFixed(2) + ',' + (e.labelPoint.y - bh / 2).toFixed(2) + ')'
+        }, badgeLayer);
+        el('rect', { class: 'badge-bg', x: 0, y: 0, width: bw, height: bh, rx: 9, stroke: e.op.typeInfo.color }, bg);
+        el('circle', { cx: 15, cy: bh / 2, r: 3.5, fill: e.op.typeInfo.color }, bg);
+        text(bg, label, {
+          class: 'badge-text', x: 25, y: bh / 2 + 4, fill: e.op.typeInfo.color
+        });
+        tooltip(bg, e.op.typeInfo.label + ' — ' + e.op.name + (e.op.detail ? '\n' + e.op.detail : ''));
+        refs.badges[e.op.id] = bg;
+        if (handlers && handlers.onOpClick) {
+          bg.addEventListener('click', function (ev) { handlers.onOpClick(e.op, ev); });
+        }
+      }
+    });
+
+    /* ---------- nodes ---------- */
+    graph.nodes.forEach(function (n) {
+      if (n.kind === 'op') drawOp(n); else drawDataset(n);
+    });
+
+    function drawDataset(n) {
+      var g = el('g', {
+        class: 'node kind-' + n.kind + ' role-' + n.role,
+        'data-node': n.id,
+        transform: 'translate(' + (n.x - n.w / 2).toFixed(2) + ',' + (n.y - n.h / 2).toFixed(2) + ')'
+      }, nodeLayer);
+      el('rect', { class: 'node-bg', x: 0, y: 0, width: n.w, height: n.h, rx: 11 }, g);
+      el('rect', {
+        x: 6, y: 10, width: Model.DS_ACCENT - 1, height: n.h - 20, rx: 2,
+        fill: ROLE_COLOR[n.role] || ROLE_COLOR.intermediate
+      }, g);
+
+      var tx = Model.DS_PAD_X + Model.DS_ACCENT;
+      var ty = 13 + 12;
+      n.lines.forEach(function (line, i) {
+        text(g, line, { class: 'node-name', x: tx, y: ty + i * Model.DS_LINE_H });
+      });
+      var metaY = 13 + n.lines.length * Model.DS_LINE_H + 7 + 10;
+      text(g, n.meta, { class: 'node-meta', x: tx, y: metaY });
+
+      if (n.role === 'source' || n.role === 'output' || n.kind === 'missing') {
+        var label = n.kind === 'missing' ? 'UNDEFINED' : n.role.toUpperCase();
+        text(g, label, {
+          class: 'node-role', x: n.w - Model.DS_PAD_X, y: metaY,
+          'text-anchor': 'end', fill: ROLE_COLOR[n.role] || ROLE_COLOR.missing
+        });
+      }
+
+      var tip = n.data.name;
+      if (n.data.description) tip += '\n' + n.data.description;
+      tooltip(g, tip);
+      refs.nodes[n.id] = g;
+      if (handlers && handlers.onNodeClick) {
+        g.addEventListener('click', function (ev) { handlers.onNodeClick(n, ev); });
+      }
+    }
+
+    function drawOp(n) {
+      var info = n.data.typeInfo;
+      var g = el('g', {
+        class: 'node kind-op',
+        'data-node': n.id,
+        transform: 'translate(' + (n.x - n.w / 2).toFixed(2) + ',' + (n.y - n.h / 2).toFixed(2) + ')'
+      }, nodeLayer);
+      el('rect', {
+        class: 'op-bg', x: 0, y: 0, width: n.w, height: n.h, rx: 14,
+        fill: info.tint, stroke: info.color
+      }, g);
+      text(g, info.label, {
+        class: 'op-type', x: n.w / 2, y: 19, 'text-anchor': 'middle', fill: info.color
+      });
+      n.lines.forEach(function (line, i) {
+        text(g, line, { class: 'op-name', x: n.w / 2, y: 38 + i * 15, 'text-anchor': 'middle' });
+      });
+      tooltip(g, info.label + ' — ' + n.data.name + (n.data.detail ? '\n' + n.data.detail : ''));
+      refs.nodes[n.id] = g;
+      if (handlers && handlers.onNodeClick) {
+        g.addEventListener('click', function (ev) { handlers.onNodeClick(n, ev); });
+      }
+    }
+
+    // No viewBox here: Interact sizes the svg to the container and drives all
+    // zoom/pan through the single transform on .viewport.
+    return refs;
+  }
+
+  global.Render = {
+    draw: draw,
+    GRAPH_CSS: GRAPH_CSS,
+    ROLE_COLOR: ROLE_COLOR,
+    edgePath: edgePath,
+    NS: NS
+  };
+})(window);
