@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+"""Bake a pipeline JSON into a single self-contained HTML graph.
+
+    python render_graph.py sample.json -o dist/base_data.html
+    python render_graph.py --serve 8000      # serve this folder for development
+
+The output inlines the CSS and JS of index.html and embeds the JSON, so the
+result is one file that opens straight from disk with no network requests.
+Standard library only -- no Node, no pip installs.
+"""
+
+import argparse
+import json
+import re
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+
+SENTINEL = re.compile(r"window\.__BAKED_DATA__\s*=\s*null;\s*/\*__BAKE_DATA__\*/")
+LINK_TAG = re.compile(
+    r"""<link\b[^>]*rel=["']stylesheet["'][^>]*>""", re.IGNORECASE
+)
+HREF_ATTR = re.compile(r"""href=["']([^"']+)["']""", re.IGNORECASE)
+SCRIPT_TAG = re.compile(
+    r"""<script\b[^>]*\bsrc=["']([^"']+)["'][^>]*>\s*</script\s*>""", re.IGNORECASE
+)
+CLOSING_SCRIPT = re.compile(r"</\s*script", re.IGNORECASE)
+
+
+def is_external(url: str) -> bool:
+    return url.startswith(("http://", "https://", "//", "data:"))
+
+
+def read_asset(base: Path, url: str) -> str:
+    path = (base / url.split("?", 1)[0].split("#", 1)[0]).resolve()
+    if not path.is_file():
+        raise SystemExit(f"error: referenced asset not found: {path}")
+    return path.read_text(encoding="utf-8")
+
+
+def inline_assets(html: str, base: Path) -> str:
+    """Replace <link rel=stylesheet> and <script src> with their file contents."""
+
+    def css_sub(match: re.Match) -> str:
+        href = HREF_ATTR.search(match.group(0))
+        if not href or is_external(href.group(1)):
+            return match.group(0)
+        return "<style>\n" + read_asset(base, href.group(1)).strip() + "\n</style>"
+
+    def js_sub(match: re.Match) -> str:
+        src = match.group(1)
+        if is_external(src):
+            return match.group(0)
+        code = read_asset(base, src)
+        if CLOSING_SCRIPT.search(code):
+            # Would terminate the inline <script> early; refuse rather than corrupt it.
+            raise SystemExit(
+                f"error: {src} contains a literal '</script' and cannot be inlined safely."
+            )
+        return "<script>\n" + code.strip() + "\n</script>"
+
+    html = LINK_TAG.sub(css_sub, html)
+    html = SCRIPT_TAG.sub(js_sub, html)
+    return html
+
+
+def embed_data(html: str, data) -> str:
+    payload = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+    # Inside JSON string values '</script>' would close the tag; '<\/' is an
+    # equivalent, legal escape. Same idea for the HTML comment opener.
+    payload = payload.replace("</", "<\\/").replace("<!--", "<\\!--")
+    replacement = "window.__BAKED_DATA__ = " + payload + ";"
+    html, count = SENTINEL.subn(lambda _m: replacement, html, count=1)
+    if not count:
+        raise SystemExit(
+            "error: could not find the '__BAKE_DATA__' sentinel in the template."
+        )
+    return html
+
+
+def validate(data) -> None:
+    if not isinstance(data, dict):
+        raise SystemExit("error: top-level JSON must be an object.")
+    datasets = data.get("datasets")
+    operations = data.get("operations")
+    if not isinstance(datasets, list) or not isinstance(operations, list):
+        raise SystemExit(
+            'error: JSON must contain "datasets" and "operations" arrays.'
+        )
+    if not datasets:
+        raise SystemExit('error: "datasets" is empty -- nothing to draw.')
+
+
+def bake(json_path: Path, out_path: Path, template: Path) -> None:
+    try:
+        data = json.loads(json_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise SystemExit(f"error: no such file: {json_path}")
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"error: {json_path.name} is not valid JSON -- {exc}")
+
+    validate(data)
+
+    if not template.is_file():
+        raise SystemExit(f"error: template not found: {template}")
+
+    html = template.read_text(encoding="utf-8")
+    html = inline_assets(html, template.parent)
+    html = embed_data(html, data)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(html, encoding="utf-8")
+
+    print(f"  title      {data.get('title', '(untitled)')}")
+    print(f"  datasets   {len(data['datasets'])}")
+    print(f"  operations {len(data['operations'])}")
+    print(f"  wrote      {out_path}  ({out_path.stat().st_size / 1024:.1f} KB)")
+
+
+def serve(port: int) -> None:
+    import functools
+    import http.server
+    import socketserver
+
+    handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(HERE))
+    with socketserver.TCPServer(("127.0.0.1", port), handler) as httpd:
+        print(f"Serving {HERE} at http://127.0.0.1:{port}/  (Ctrl+C to stop)")
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            print("\nstopped")
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Bake a pipeline JSON into a standalone HTML graph."
+    )
+    parser.add_argument("json", nargs="?", help="pipeline JSON to embed")
+    parser.add_argument(
+        "-o", "--out", default=None, help="output HTML path (default: <json name>.html)"
+    )
+    parser.add_argument(
+        "-t", "--template", default=str(HERE / "index.html"), help="template HTML"
+    )
+    parser.add_argument(
+        "--serve", type=int, metavar="PORT", help="serve this folder over http instead of baking"
+    )
+    args = parser.parse_args(argv)
+
+    if args.serve:
+        serve(args.serve)
+        return 0
+
+    if not args.json:
+        parser.error("provide a JSON file, or use --serve PORT")
+
+    json_path = Path(args.json).resolve()
+    out_path = Path(args.out).resolve() if args.out else json_path.with_suffix(".html")
+    bake(json_path, out_path, Path(args.template).resolve())
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
