@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pipeline graph</title>
+<link rel="stylesheet" href="css/styles.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="titles">
+    <h1 id="title">Pipeline graph</h1>
+    <p class="sub"><span id="source"></span><span id="stats"></span></p>
+  </div>
+
+  <div class="tools">
+    <div class="field search-field">
+      <input id="search" type="search" placeholder="Search datasets, columns, steps…" autocomplete="off" spellcheck="false">
+      <span id="search-status" class="search-status"></span>
+    </div>
+
+    <div class="segmented" role="group" aria-label="Operation display mode">
+      <button type="button" data-mode="compact" class="is-active" title="Single-input steps ride on the edges">Compact</button>
+      <button type="button" data-mode="explicit" title="Every step gets its own node">Explicit</button>
+    </div>
+
+    <div class="group" role="group" aria-label="Zoom">
+      <button type="button" id="btn-zoom-out" title="Zoom out (−)">&minus;</button>
+      <span id="zoom-label" class="zoom-label">100%</span>
+      <button type="button" id="btn-zoom-in" title="Zoom in (+)">+</button>
+      <button type="button" id="btn-fit" title="Fit to screen (0)">Fit</button>
+    </div>
+
+    <div class="group" role="group" aria-label="Data">
+      <button type="button" id="btn-load">Load JSON</button>
+      <button type="button" id="btn-paste">Paste</button>
+    </div>
+
+    <div class="group" role="group" aria-label="Export">
+      <button type="button" id="btn-svg">SVG</button>
+      <button type="button" id="btn-png">PNG</button>
+    </div>
+  </div>
+
+  <div id="legend" class="legend"></div>
+</header>
+
+<div id="warnings" class="warnings"></div>
+
+<main class="workspace">
+  <div id="stage" class="stage">
+    <svg id="graph" xmlns="http://www.w3.org/2000/svg"></svg>
+
+    <div class="empty">
+      <div class="empty-card">
+        <h2>Drop a pipeline JSON here</h2>
+        <p>Or use <strong>Load JSON</strong> / <strong>Paste</strong> above. Browsers block a
+          local page from reading files on its own, so the JSON has to be handed to it — or
+          baked in with <code>render_graph.py</code>.</p>
+        <pre>{
+  "title": "…",
+  "datasets":  [ { "id", "name", "description", "tags", "columns" } ],
+  "operations":[ { "id", "name", "type", "from": [], "to", "detail" } ]
+}</pre>
+        <p class="hint">Sources render at the top, outputs at the bottom. Click any node to
+          trace its lineage.</p>
+      </div>
+    </div>
+  </div>
+
+  <aside id="panel" class="panel" aria-live="polite"></aside>
+</main>
+
+<div id="drop-overlay" class="drop-overlay"><div>Release to load this JSON</div></div>
+
+<div id="paste-modal" class="modal">
+  <div class="modal-card">
+    <h2>Paste pipeline JSON</h2>
+    <textarea id="paste-text" spellcheck="false" placeholder='{"title": "…", "datasets": [], "operations": []}'></textarea>
+    <div class="modal-actions">
+      <button type="button" id="paste-cancel" class="ghost">Cancel</button>
+      <button type="button" id="paste-ok" class="primary">Render</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast"></div>
+
+<input id="file-input" type="file" accept=".json,application/json" hidden>
+
+<script>window.__BAKED_DATA__ = null; /*__BAKE_DATA__*/</script>
+<script src="js/model.js"></script>
+<script src="js/layout.js"></script>
+<script src="js/render.js"></script>
+<script src="js/interact.js"></script>
+<script src="js/export.js"></script>
+<script src="js/main.js"></script>
+</body>
+</html>
