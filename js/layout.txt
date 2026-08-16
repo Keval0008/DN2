@@ -1,0 +1,354 @@
+/* layout.js — layered top-down DAG layout (sources at top, outputs at bottom).
+   Exposes window.Layout. */
+(function (global) {
+  'use strict';
+
+  var NODE_GAP = 46;    // horizontal gap inside a rank
+  var RANK_GAP = 104;   // vertical gap between ranks (must clear an edge badge)
+  var PADDING = 56;     // canvas margin around the drawing
+  var ALIGN_PASSES = 4;
+  var ARROW_STUB = 14;  // straight vertical run an edge lands on, for the arrowhead
+
+  /* ---------- 1-2. longest-path ranking, tolerant of cycles ---------- */
+
+  function rankNodes(graph) {
+    var indeg = Object.create(null);
+    var rank = Object.create(null);
+    var cyclic = false;
+
+    graph.nodes.forEach(function (n) {
+      indeg[n.id] = graph.pred[n.id].length;
+      rank[n.id] = 0;
+    });
+
+    var queue = graph.nodes.filter(function (n) { return indeg[n.id] === 0; }).map(function (n) { return n.id; });
+    var settled = Object.create(null);
+    var processed = 0;
+
+    while (queue.length) {
+      var id = queue.shift();
+      settled[id] = true;
+      processed++;
+      graph.succ[id].forEach(function (e) {
+        if (rank[e.to] < rank[id] + 1) rank[e.to] = rank[id] + 1;
+        if (--indeg[e.to] === 0) queue.push(e.to);
+      });
+    }
+
+    if (processed < graph.nodes.length) {
+      // Everything left sits on a cycle. Rank it from whatever is already settled
+      // so the graph still draws, and flag the offending edges.
+      cyclic = true;
+      graph.nodes.forEach(function (n) {
+        if (settled[n.id]) return;
+        var best = 0;
+        graph.pred[n.id].forEach(function (e) {
+          if (settled[e.from]) best = Math.max(best, rank[e.from] + 1);
+        });
+        rank[n.id] = best;
+        settled[n.id] = true;
+      });
+      graph.edges.forEach(function (e) {
+        if (rank[e.to] <= rank[e.from]) e.back = true;
+      });
+    }
+
+    /* 3. Pin terminal nodes to the bottom rank so outputs line up.
+       Only sinks are pinned — moving a node that still feeds something
+       downstream would invert its own edges. */
+    var maxRank = 0;
+    graph.nodes.forEach(function (n) { maxRank = Math.max(maxRank, rank[n.id]); });
+    graph.nodes.forEach(function (n) {
+      if (n.kind === 'op') return;
+      if (graph.succ[n.id].length === 0) rank[n.id] = maxRank;
+    });
+
+    return { rank: rank, maxRank: maxRank, cyclic: cyclic };
+  }
+
+  /* ---------- 4. dummy nodes for edges that span more than one rank ---------- */
+
+  function insertDummies(graph, rank) {
+    var layerNodes = {};
+    function push(r, item) { (layerNodes[r] || (layerNodes[r] = [])).push(item); }
+
+    graph.nodes.forEach(function (n) {
+      n.rank = rank[n.id];
+      push(n.rank, n);
+    });
+
+    var dummyId = 0;
+    graph.edges.forEach(function (e) {
+      var r0 = rank[e.from];
+      var r1 = rank[e.to];
+      e.chain = [];
+      if (e.back || r1 <= r0 + 1) return;
+      for (var r = r0 + 1; r < r1; r++) {
+        var d = {
+          id: '__d' + (dummyId++),
+          kind: 'dummy',
+          w: 1,
+          h: 1,
+          rank: r,
+          edge: e
+        };
+        e.chain.push(d);
+        push(r, d);
+      }
+    });
+
+    var layers = [];
+    var maxRank = 0;
+    Object.keys(layerNodes).forEach(function (k) { maxRank = Math.max(maxRank, +k); });
+    for (var i = 0; i <= maxRank; i++) layers.push(layerNodes[i] || []);
+    return layers;
+  }
+
+  /* ---------- 5. within-rank ordering (barycenter sweeps) ---------- */
+
+  /* Neighbour list in layout space: a dummy chain is walked step by step so
+     long edges behave like a sequence of one-rank edges. */
+  function buildLayoutAdjacency(graph, layers) {
+    var up = Object.create(null);   // node id -> ids in the rank above
+    var down = Object.create(null); // node id -> ids in the rank below
+    layers.forEach(function (layer) {
+      layer.forEach(function (n) { up[n.id] = []; down[n.id] = []; });
+    });
+    function link(a, b) {
+      if (!down[a] || !up[b]) return;
+      down[a].push(b);
+      up[b].push(a);
+    }
+    graph.edges.forEach(function (e) {
+      if (e.back) return;
+      var path = [e.from].concat(e.chain.map(function (d) { return d.id; }), [e.to]);
+      for (var i = 0; i < path.length - 1; i++) link(path[i], path[i + 1]);
+    });
+    return { up: up, down: down };
+  }
+
+  function orderLayers(layers, adj) {
+    layers.forEach(function (layer) {
+      layer.forEach(function (n, i) { n.order = i; });
+    });
+
+    function positionOf(layer) {
+      var pos = Object.create(null);
+      layer.forEach(function (n, i) { pos[n.id] = i; });
+      return pos;
+    }
+
+    function crossings() {
+      var total = 0;
+      for (var i = 0; i < layers.length - 1; i++) {
+        var lower = positionOf(layers[i + 1]);
+        var pairs = [];
+        layers[i].forEach(function (n, ni) {
+          (adj.down[n.id] || []).forEach(function (m) {
+            if (lower[m] != null) pairs.push([ni, lower[m]]);
+          });
+        });
+        for (var a = 0; a < pairs.length; a++) {
+          for (var b = a + 1; b < pairs.length; b++) {
+            if ((pairs[a][0] - pairs[b][0]) * (pairs[a][1] - pairs[b][1]) < 0) total++;
+          }
+        }
+      }
+      return total;
+    }
+
+    function snapshot() { return layers.map(function (l) { return l.slice(); }); }
+    function restore(snap) { snap.forEach(function (l, i) { layers[i] = l; }); }
+
+    var best = snapshot();
+    var bestScore = crossings();
+
+    for (var pass = 0; pass < 4; pass++) {
+      var downward = pass % 2 === 0;
+      for (var li = 0; li < layers.length; li++) {
+        var idx = downward ? li : layers.length - 1 - li;
+        if ((downward && idx === 0) || (!downward && idx === layers.length - 1)) continue;
+        var refPos = positionOf(layers[downward ? idx - 1 : idx + 1]);
+        var side = downward ? adj.up : adj.down;
+        layers[idx].forEach(function (n, i) {
+          var neighbours = (side[n.id] || []).map(function (m) { return refPos[m]; })
+            .filter(function (v) { return v != null; });
+          n._bary = neighbours.length
+            ? neighbours.reduce(function (a, b) { return a + b; }, 0) / neighbours.length
+            : i;
+          n._tie = i;
+        });
+        layers[idx].sort(function (a, b) { return (a._bary - b._bary) || (a._tie - b._tie); });
+      }
+      var score = crossings();
+      if (score < bestScore) {
+        bestScore = score;
+        best = snapshot();
+      }
+    }
+    restore(best);
+    layers.forEach(function (layer) {
+      layer.forEach(function (n, i) { n.order = i; });
+    });
+  }
+
+  /* ---------- 6-7. coordinates ---------- */
+
+  function assignX(layers, adj) {
+    var posX = Object.create(null);
+
+    function remember(layer) {
+      layer.forEach(function (n) { posX[n.id] = n.x; });
+    }
+    function centre(layer) {
+      if (!layer.length) return;
+      var left = layer[0].x - layer[0].w / 2;
+      var right = layer[layer.length - 1].x + layer[layer.length - 1].w / 2;
+      var shift = -(left + right) / 2;
+      layer.forEach(function (n) { n.x += shift; });
+    }
+    /* Push right to restore minimum separation after nodes are nudged. */
+    function separate(layer) {
+      for (var i = 1; i < layer.length; i++) {
+        var need = layer[i - 1].x + layer[i - 1].w / 2 + NODE_GAP + layer[i].w / 2;
+        if (layer[i].x < need) layer[i].x = need;
+      }
+      centre(layer);
+    }
+
+    // Seed: pack each rank left-to-right, centred on zero.
+    layers.forEach(function (layer) {
+      var cursor = 0;
+      layer.forEach(function (n) {
+        n.x = cursor + n.w / 2;
+        cursor += n.w + NODE_GAP;
+      });
+      centre(layer);
+      remember(layer);
+    });
+
+    // Alternate sweeps pulling each node toward the mean x of its neighbours in
+    // the adjacent rank. Linear chains converge to a straight column.
+    for (var pass = 0; pass < ALIGN_PASSES; pass++) {
+      var downward = pass % 2 === 0;
+      var side = downward ? adj.up : adj.down;
+      for (var li = 0; li < layers.length; li++) {
+        var layer = layers[downward ? li : layers.length - 1 - li];
+        layer.forEach(function (n) {
+          var xs = (side[n.id] || [])
+            .map(function (m) { return posX[m]; })
+            .filter(function (v) { return v != null; });
+          if (xs.length) {
+            n.x = xs.reduce(function (a, b) { return a + b; }, 0) / xs.length;
+          }
+        });
+        layer.sort(function (a, b) { return (a.x - b.x) || (a.order - b.order); });
+        layer.forEach(function (n, i) { n.order = i; });
+        separate(layer);
+        remember(layer);
+      }
+    }
+  }
+
+  function assignY(layers) {
+    var y = 0;
+    layers.forEach(function (layer) {
+      var tallest = 0;
+      layer.forEach(function (n) { tallest = Math.max(tallest, n.h); });
+      var centreY = y + tallest / 2;
+      layer.forEach(function (n) { n.y = centreY; });
+      y += tallest + RANK_GAP;
+    });
+  }
+
+  /* ---------- edge geometry ---------- */
+
+  function routeEdges(graph) {
+    graph.edges.forEach(function (e) {
+      var a = graph.byId[e.from];
+      var b = graph.byId[e.to];
+      if (!a || !b) { e.points = []; return; }
+      var pts = [{ x: a.x, y: a.y + a.h / 2 }];
+      e.chain.forEach(function (d) { pts.push({ x: d.x, y: d.y }); });
+      // Land on a short straight vertical run. The arrowhead is oriented to the
+      // tangent at the very endpoint, which is always vertical; without this stub
+      // an edge sweeping in from far sideways still curves across those last few
+      // pixels and the head visibly detaches from the line.
+      var endY = b.y - b.h / 2;
+      var prev = pts[pts.length - 1];
+      var stub = Math.min(ARROW_STUB, Math.max(0, (endY - prev.y) / 2));
+      if (stub > 1) pts.push({ x: b.x, y: endY - stub });
+      pts.push({ x: b.x, y: endY });
+      if (e.back) {
+        // A cycle edge runs upward; keep it a simple straight hop, drawn dashed.
+        pts = [{ x: a.x, y: a.y - a.h / 2 }, { x: b.x, y: b.y + b.h / 2 }];
+      }
+      e.points = pts;
+      e.labelPoint = pointAt(pts, e.t == null ? 0.5 : e.t);
+    });
+  }
+
+  /* Point at fraction t along the polyline, by arc length. */
+  function pointAt(pts, t) {
+    if (pts.length < 2) return pts[0] || { x: 0, y: 0 };
+    var segs = [];
+    var total = 0;
+    for (var i = 0; i < pts.length - 1; i++) {
+      var dx = pts[i + 1].x - pts[i].x;
+      var dy = pts[i + 1].y - pts[i].y;
+      var len = Math.sqrt(dx * dx + dy * dy) || 0.0001;
+      segs.push(len);
+      total += len;
+    }
+    var target = total * t;
+    for (var s = 0; s < segs.length; s++) {
+      if (target <= segs[s]) {
+        var f = segs[s] ? target / segs[s] : 0;
+        return {
+          x: pts[s].x + (pts[s + 1].x - pts[s].x) * f,
+          y: pts[s].y + (pts[s + 1].y - pts[s].y) * f
+        };
+      }
+      target -= segs[s];
+    }
+    return pts[pts.length - 1];
+  }
+
+  /* ---------- entry point ---------- */
+
+  function compute(graph) {
+    var ranked = rankNodes(graph);
+    var layers = insertDummies(graph, ranked.rank);
+    var adj = buildLayoutAdjacency(graph, layers);
+    orderLayers(layers, adj);
+    assignX(layers, adj);
+    assignY(layers);
+
+    // Shift everything into positive space with a margin.
+    var minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    graph.nodes.forEach(function (n) {
+      minX = Math.min(minX, n.x - n.w / 2);
+      maxX = Math.max(maxX, n.x + n.w / 2);
+      minY = Math.min(minY, n.y - n.h / 2);
+      maxY = Math.max(maxY, n.y + n.h / 2);
+    });
+    if (!isFinite(minX)) { minX = 0; minY = 0; maxX = 1; maxY = 1; }
+    var dx = PADDING - minX;
+    var dy = PADDING - minY;
+    layers.forEach(function (layer) {
+      layer.forEach(function (n) { n.x += dx; n.y += dy; });
+    });
+
+    routeEdges(graph);
+
+    return {
+      graph: graph,
+      layers: layers,
+      cyclic: ranked.cyclic,
+      width: (maxX - minX) + PADDING * 2,
+      height: (maxY - minY) + PADDING * 2
+    };
+  }
+
+  global.Layout = { compute: compute, RANK_GAP: RANK_GAP, PADDING: PADDING };
+})(window);
