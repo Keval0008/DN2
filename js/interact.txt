@@ -1,0 +1,437 @@
+/* interact.js — zoom/pan, selection, lineage focus, side panel, search.
+   Exposes window.Interact. */
+(function (global) {
+  'use strict';
+
+  var MIN_K = 0.12;
+  var MAX_K = 4;
+
+  var S = {
+    svg: null, stage: null, panel: null,
+    layout: null, refs: null, parsed: null,
+    k: 1, tx: 0, ty: 0,
+    selection: null,
+    hits: [], hitIndex: -1,
+    onStatus: null
+  };
+
+  function esc(str) {
+    return String(str == null ? '' : str)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
+  /* ---------- transform ---------- */
+
+  function applyTransform() {
+    if (!S.refs) return;
+    S.refs.viewport.setAttribute(
+      'transform',
+      'translate(' + S.tx.toFixed(2) + ',' + S.ty.toFixed(2) + ') scale(' + S.k.toFixed(4) + ')'
+    );
+    if (S.onStatus) S.onStatus({ zoom: S.k });
+  }
+
+  function resize() {
+    if (!S.svg || !S.stage) return;
+    var w = S.stage.clientWidth || 1;
+    var h = S.stage.clientHeight || 1;
+    S.svg.setAttribute('width', w);
+    S.svg.setAttribute('height', h);
+    S.svg.setAttribute('viewBox', '0 0 ' + w + ' ' + h);
+  }
+
+  function tweenTo(k, tx, ty) {
+    var k0 = S.k, x0 = S.tx, y0 = S.ty;
+    var start = null;
+    var dur = 260;
+    function step(ts) {
+      if (start == null) start = ts;
+      var t = Math.min(1, (ts - start) / dur);
+      var e = t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t; // easeInOutQuad
+      S.k = k0 + (k - k0) * e;
+      S.tx = x0 + (tx - x0) * e;
+      S.ty = y0 + (ty - y0) * e;
+      applyTransform();
+      if (t < 1) requestAnimationFrame(step);
+    }
+    requestAnimationFrame(step);
+  }
+
+  function fit(animate) {
+    if (!S.layout) return;
+    resize();
+    var cw = S.stage.clientWidth || 1;
+    var ch = S.stage.clientHeight || 1;
+    var k = Math.min(cw / S.layout.width, ch / S.layout.height, 1);
+    k = Math.max(MIN_K, Math.min(MAX_K, k));
+    var tx = (cw - S.layout.width * k) / 2;
+    var ty = (ch - S.layout.height * k) / 2;
+    if (animate) tweenTo(k, tx, ty);
+    else { S.k = k; S.tx = tx; S.ty = ty; applyTransform(); }
+  }
+
+  function zoomBy(factor) {
+    var cw = S.stage.clientWidth / 2;
+    var ch = S.stage.clientHeight / 2;
+    zoomAt(cw, ch, factor);
+  }
+
+  function zoomAt(px, py, factor) {
+    var k = Math.max(MIN_K, Math.min(MAX_K, S.k * factor));
+    if (k === S.k) return;
+    // Keep the graph point under the cursor pinned.
+    S.tx = px - (px - S.tx) * (k / S.k);
+    S.ty = py - (py - S.ty) * (k / S.k);
+    S.k = k;
+    applyTransform();
+  }
+
+  function centreOn(x, y) {
+    var cw = (S.stage.clientWidth || 1) / 2;
+    var ch = (S.stage.clientHeight || 1) / 2;
+    tweenTo(S.k, cw - x * S.k, ch - y * S.k);
+  }
+
+  /* ---------- lineage focus ---------- */
+
+  function clearFocus() {
+    if (!S.refs) return;
+    S.refs.viewport.classList.remove('has-focus');
+    Object.keys(S.refs.nodes).forEach(function (id) {
+      S.refs.nodes[id].classList.remove('is-focus', 'is-up', 'is-down');
+    });
+    Object.keys(S.refs.edges).forEach(function (id) {
+      S.refs.edges[id].classList.remove('is-lineage');
+    });
+    Object.keys(S.refs.badges).forEach(function (id) {
+      S.refs.badges[id].classList.remove('is-lineage');
+    });
+    S.selection = null;
+  }
+
+  function applyFocus(focusIds, up, down, focusBadgeId) {
+    var graph = S.layout.graph;
+    var lit = Object.create(null);
+    focusIds.forEach(function (id) { lit[id] = 'focus'; });
+    Object.keys(up).forEach(function (id) { if (!lit[id]) lit[id] = 'up'; });
+    Object.keys(down).forEach(function (id) { if (!lit[id]) lit[id] = 'down'; });
+
+    S.refs.viewport.classList.add('has-focus');
+    Object.keys(S.refs.nodes).forEach(function (id) {
+      var g = S.refs.nodes[id];
+      g.classList.remove('is-focus', 'is-up', 'is-down');
+      if (lit[id]) g.classList.add('is-' + lit[id]);
+    });
+    graph.edges.forEach(function (e) {
+      var on = lit[e.from] && lit[e.to];
+      var edgeEl = S.refs.edges[e.id];
+      if (edgeEl) edgeEl.classList.toggle('is-lineage', !!on);
+      if (e.op && S.refs.badges[e.op.id]) {
+        S.refs.badges[e.op.id].classList.toggle('is-lineage', !!on);
+      }
+    });
+    if (focusBadgeId && S.refs.badges[focusBadgeId]) {
+      S.refs.badges[focusBadgeId].classList.add('is-lineage');
+    }
+  }
+
+  function merge(target, source) {
+    Object.keys(source).forEach(function (k) { target[k] = true; });
+    return target;
+  }
+
+  function selectNode(node) {
+    var graph = S.layout.graph;
+    var lin = Model.lineage(graph, node.id);
+    S.selection = { type: 'node', id: node.id };
+    applyFocus([node.id], lin.up, lin.down);
+    if (node.kind === 'op') renderOpPanel(node.data);
+    else renderDatasetPanel(node.data);
+  }
+
+  function selectOp(op) {
+    var graph = S.layout.graph;
+    var nodeId = 'op:' + op.id;
+    if (graph.byId[nodeId]) { selectNode(graph.byId[nodeId]); return; }
+    // Collapsed into an edge badge: light the datasets on either side plus their lineage.
+    var up = Object.create(null);
+    var down = Object.create(null);
+    op.from.forEach(function (f) {
+      up[f] = true;
+      merge(up, Model.lineage(graph, f).up);
+    });
+    op.to.forEach(function (t) {
+      down[t] = true;
+      merge(down, Model.lineage(graph, t).down);
+    });
+    S.selection = { type: 'op', id: op.id };
+    applyFocus([], up, down, op.id);
+    renderOpPanel(op);
+  }
+
+  function selectById(id) {
+    var graph = S.layout.graph;
+    if (graph.byId[id]) { selectNode(graph.byId[id]); centreNode(id); return; }
+    var op = S.parsed.opById[id];
+    if (op) { selectOp(op); centreOp(op); }
+  }
+
+  function centreNode(id) {
+    var n = S.layout.graph.byId[id];
+    if (n) centreOn(n.x, n.y);
+  }
+
+  function centreOp(op) {
+    var n = S.layout.graph.byId['op:' + op.id];
+    if (n) { centreOn(n.x, n.y); return; }
+    var found = null;
+    S.layout.graph.edges.forEach(function (e) {
+      if (e.op && e.op.id === op.id && e.labelPoint && !found) found = e.labelPoint;
+    });
+    if (found) centreOn(found.x, found.y);
+  }
+
+  /* ---------- side panel ---------- */
+
+  function chip(label, cls) {
+    return '<span class="chip' + (cls ? ' ' + cls : '') + '">' + esc(label) + '</span>';
+  }
+
+  function linkList(items) {
+    if (!items.length) return '<p class="muted">None</p>';
+    return '<ul class="link-list">' + items.map(function (it) {
+      return '<li><button type="button" class="link" data-select="' + esc(it.id) + '">' +
+        esc(it.label) + '</button></li>';
+    }).join('') + '</ul>';
+  }
+
+  function showPanel(html) {
+    S.panel.innerHTML = html;
+    S.panel.classList.add('is-open');
+    S.panel.scrollTop = 0;
+    Array.prototype.forEach.call(S.panel.querySelectorAll('[data-select]'), function (btn) {
+      btn.addEventListener('click', function () { selectById(btn.getAttribute('data-select')); });
+    });
+    var close = S.panel.querySelector('[data-close]');
+    if (close) close.addEventListener('click', closePanel);
+  }
+
+  function closePanel() {
+    S.panel.classList.remove('is-open');
+    S.panel.innerHTML = '';
+    clearFocus();
+  }
+
+  function renderDatasetPanel(ds) {
+    var producedBy = S.parsed.operations.filter(function (op) { return op.to.indexOf(ds.id) >= 0; });
+    var feeds = S.parsed.operations.filter(function (op) { return op.from.indexOf(ds.id) >= 0; });
+    var roleNode = S.layout.graph.byId[ds.id];
+    var role = roleNode ? roleNode.role : 'dataset';
+
+    var html = '' +
+      '<button type="button" class="panel-close" data-close aria-label="Close panel">&times;</button>' +
+      '<p class="kicker">' + esc(ds.missing ? 'Undefined dataset' : role === 'source' ? 'Source dataset'
+        : role === 'output' ? 'Output dataset' : 'Dataset') + '</p>' +
+      '<h2>' + esc(ds.name) + '</h2>' +
+      '<p class="mono-id">' + esc(ds.id) + '</p>' +
+      (ds.tags.length ? '<div class="chips">' + ds.tags.map(function (t) { return chip(t); }).join('') + '</div>' : '') +
+      (ds.description ? '<p class="desc">' + esc(ds.description) + '</p>' : '') +
+      '<h3>Produced by</h3>' + linkList(producedBy.map(function (op) {
+        return { id: op.id, label: op.typeInfo.label + ' · ' + op.name };
+      })) +
+      '<h3>Feeds into</h3>' + linkList(feeds.map(function (op) {
+        return { id: op.id, label: op.typeInfo.label + ' · ' + op.name };
+      })) +
+      '<h3>Columns <span class="count">' + ds.columns.length + '</span></h3>' +
+      (ds.columns.length
+        ? '<ol class="columns">' + ds.columns.map(function (c) {
+            return '<li>' + esc(c) + '</li>';
+          }).join('') + '</ol>'
+        : '<p class="muted">No columns listed.</p>');
+    showPanel(html);
+  }
+
+  function renderOpPanel(op) {
+    function dsLabel(id) {
+      var d = S.parsed.datasets[id];
+      return { id: id, label: d ? d.name : id };
+    }
+    var html = '' +
+      '<button type="button" class="panel-close" data-close aria-label="Close panel">&times;</button>' +
+      '<p class="kicker" style="color:' + op.typeInfo.color + '">' + esc(op.typeInfo.label) + '</p>' +
+      '<h2>' + esc(op.name) + '</h2>' +
+      '<p class="mono-id">' + esc(op.id) + '</p>' +
+      (op.detail ? '<p class="desc">' + esc(op.detail) + '</p>' : '') +
+      '<h3>Inputs <span class="count">' + op.from.length + '</span></h3>' +
+      linkList(op.from.map(dsLabel)) +
+      '<h3>Output <span class="count">' + op.to.length + '</span></h3>' +
+      linkList(op.to.map(dsLabel));
+    showPanel(html);
+  }
+
+  /* ---------- search ---------- */
+
+  function clearHits() {
+    if (!S.refs) return;
+    Object.keys(S.refs.nodes).forEach(function (id) {
+      S.refs.nodes[id].classList.remove('is-hit', 'is-hit-active');
+    });
+    Object.keys(S.refs.badges).forEach(function (id) {
+      S.refs.badges[id].classList.remove('is-hit', 'is-hit-active');
+    });
+    S.hits = [];
+    S.hitIndex = -1;
+  }
+
+  function search(query) {
+    clearHits();
+    var q = String(query || '').trim().toLowerCase();
+    if (!q) {
+      if (S.onStatus) S.onStatus({ search: '' });
+      return;
+    }
+    var graph = S.layout.graph;
+    var seen = Object.create(null);
+
+    graph.nodes.forEach(function (n) {
+      var hay;
+      if (n.kind === 'op') {
+        hay = [n.data.name, n.data.type, n.data.detail].join(' ');
+      } else {
+        hay = [n.data.name, n.data.id, n.data.description, n.data.tags.join(' '), n.data.columns.join(' ')].join(' ');
+      }
+      if (hay.toLowerCase().indexOf(q) >= 0) {
+        S.hits.push({ id: n.id, el: S.refs.nodes[n.id], node: n });
+        seen[n.id] = true;
+      }
+    });
+    // Operations collapsed onto edges have a badge instead of a node.
+    S.parsed.operations.forEach(function (op) {
+      if (seen['op:' + op.id] || !S.refs.badges[op.id]) return;
+      var hay = [op.name, op.type, op.detail].join(' ').toLowerCase();
+      if (hay.indexOf(q) >= 0) S.hits.push({ id: op.id, el: S.refs.badges[op.id], op: op });
+    });
+
+    S.hits.forEach(function (h) { if (h.el) h.el.classList.add('is-hit'); });
+    if (S.hits.length) gotoHit(0);
+    if (S.onStatus) {
+      S.onStatus({ search: S.hits.length ? (S.hitIndex + 1) + ' of ' + S.hits.length : 'no matches' });
+    }
+  }
+
+  function gotoHit(index) {
+    if (!S.hits.length) return;
+    S.hits.forEach(function (h) { if (h.el) h.el.classList.remove('is-hit-active'); });
+    S.hitIndex = ((index % S.hits.length) + S.hits.length) % S.hits.length;
+    var hit = S.hits[S.hitIndex];
+    if (hit.el) hit.el.classList.add('is-hit-active');
+    if (hit.node) centreOn(hit.node.x, hit.node.y);
+    else if (hit.op) centreOp(hit.op);
+    if (S.onStatus) S.onStatus({ search: (S.hitIndex + 1) + ' of ' + S.hits.length });
+  }
+
+  function nextHit() { gotoHit(S.hitIndex + 1); }
+
+  /* ---------- wiring ---------- */
+
+  function init(opts) {
+    S.svg = opts.svg;
+    S.stage = opts.stage;
+    S.panel = opts.panel;
+    S.onStatus = opts.onStatus;
+
+    S.stage.addEventListener('wheel', function (ev) {
+      if (!S.refs) return;
+      ev.preventDefault();
+      var rect = S.stage.getBoundingClientRect();
+      var factor = Math.exp(-ev.deltaY * 0.0016);
+      zoomAt(ev.clientX - rect.left, ev.clientY - rect.top, factor);
+    }, { passive: false });
+
+    var drag = null;
+    S.stage.addEventListener('pointerdown', function (ev) {
+      if (ev.button !== 0 || !S.refs) return;
+      drag = { x: ev.clientX, y: ev.clientY, tx: S.tx, ty: S.ty, moved: false, id: ev.pointerId };
+      // Capture is deliberately NOT taken here: capturing retargets the click
+      // that follows to the stage, which would stop node clicks from landing.
+    });
+    S.stage.addEventListener('pointermove', function (ev) {
+      if (!drag) return;
+      var dx = ev.clientX - drag.x;
+      var dy = ev.clientY - drag.y;
+      if (!drag.moved) {
+        if (Math.abs(dx) + Math.abs(dy) <= 3) return;
+        drag.moved = true;
+        S.stage.classList.add('is-panning');
+        // Now that this is a real pan, capture so it survives leaving the stage.
+        try { S.stage.setPointerCapture(drag.id); } catch (e) { /* pointer already gone */ }
+      }
+      S.tx = drag.tx + dx;
+      S.ty = drag.ty + dy;
+      applyTransform();
+    });
+    function endDrag(ev) {
+      if (!drag) return;
+      var moved = drag.moved;
+      var id = drag.id;
+      drag = null;
+      S.stage.classList.remove('is-panning');
+      if (S.stage.hasPointerCapture && S.stage.hasPointerCapture(id)) {
+        S.stage.releasePointerCapture(id);
+      }
+      // Suppress the click that follows a pan gesture.
+      if (moved) {
+        var swallow = function (e) { e.stopPropagation(); };
+        S.stage.addEventListener('click', swallow, { capture: true, once: true });
+      }
+    }
+    S.stage.addEventListener('pointerup', endDrag);
+    S.stage.addEventListener('pointercancel', endDrag);
+
+    // A click on empty canvas clears the current focus.
+    S.stage.addEventListener('click', function (ev) {
+      if (!S.refs) return;
+      if (ev.target.closest && ev.target.closest('.node, .badge')) return;
+      closePanel();
+    });
+
+    document.addEventListener('keydown', function (ev) {
+      var typing = /^(INPUT|TEXTAREA)$/.test(document.activeElement && document.activeElement.tagName);
+      if (ev.key === 'Escape') { closePanel(); return; }
+      if (typing) return;
+      if (ev.key === '0') { fit(true); }
+      else if (ev.key === '+' || ev.key === '=') { zoomBy(1.2); }
+      else if (ev.key === '-' || ev.key === '_') { zoomBy(1 / 1.2); }
+    });
+
+    window.addEventListener('resize', function () { resize(); });
+  }
+
+  function setGraph(layout, refs, parsed) {
+    S.layout = layout;
+    S.refs = refs;
+    S.parsed = parsed;
+    S.selection = null;
+    S.hits = [];
+    S.hitIndex = -1;
+    resize();
+    applyTransform();
+  }
+
+  global.Interact = {
+    init: init,
+    setGraph: setGraph,
+    fit: fit,
+    resize: resize,
+    zoomBy: zoomBy,
+    selectNode: selectNode,
+    selectOp: selectOp,
+    selectById: selectById,
+    clearFocus: clearFocus,
+    closePanel: closePanel,
+    search: search,
+    nextHit: nextHit,
+    getTransform: function () { return { k: S.k, tx: S.tx, ty: S.ty }; }
+  };
+})(window);
