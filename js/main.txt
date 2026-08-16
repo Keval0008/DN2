@@ -1,0 +1,276 @@
+/* main.js — app state, JSON loading, toolbar wiring. Exposes window.App. */
+(function (global) {
+  'use strict';
+
+  var state = {
+    parsed: null,
+    layout: null,
+    refs: null,
+    mode: 'compact',
+    sourceName: ''
+  };
+
+  var $ = function (id) { return document.getElementById(id); };
+  var els = {};
+
+  /* ---------- messaging ---------- */
+
+  var toastTimer = null;
+  function toast(message, kind) {
+    var t = els.toast;
+    t.textContent = message;
+    t.className = 'toast is-visible' + (kind ? ' ' + kind : '');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () { t.className = 'toast'; }, 5200);
+  }
+
+  function showWarnings(list) {
+    var box = els.warnings;
+    if (!list.length) { box.className = 'warnings'; box.innerHTML = ''; return; }
+    box.className = 'warnings is-visible';
+    box.innerHTML =
+      '<strong>' + list.length + (list.length === 1 ? ' issue' : ' issues') + ' in this JSON</strong>' +
+      '<ul>' + list.map(function (w) {
+        return '<li>' + String(w).replace(/&/g, '&amp;').replace(/</g, '&lt;') + '</li>';
+      }).join('') + '</ul>' +
+      '<button type="button" class="warnings-close" aria-label="Dismiss">&times;</button>';
+    box.querySelector('.warnings-close').addEventListener('click', function () {
+      box.className = 'warnings';
+    });
+  }
+
+  /* ---------- render pipeline ---------- */
+
+  function render(preserveSelection) {
+    if (!state.parsed) return;
+    var graph = Model.buildGraph(state.parsed, state.mode);
+    var layout = Layout.compute(graph);
+    var refs = Render.draw(els.svg, layout, {
+      onNodeClick: function (node) { Interact.selectNode(node); },
+      onOpClick: function (op) { Interact.selectOp(op); }
+    });
+    state.layout = layout;
+    state.refs = refs;
+
+    Interact.setGraph(layout, refs, state.parsed);
+
+    // Chrome that can change the stage size (warning banner, legend row) must be
+    // written before fitting, or the fit is computed against a stale viewport.
+    var warnings = state.parsed.warnings.slice();
+    if (layout.cyclic) warnings.push('This graph contains a cycle. Back-edges are drawn dashed and ranking is approximate.');
+    showWarnings(warnings);
+
+    var dsCount = state.parsed.datasetOrder.length;
+    var opCount = state.parsed.operations.length;
+    els.stats.textContent = dsCount + (dsCount === 1 ? ' dataset' : ' datasets') + ' · ' +
+      opCount + (opCount === 1 ? ' operation' : ' operations');
+    renderLegend();
+
+    Interact.fit(false);
+
+    if (preserveSelection) Interact.selectById(preserveSelection);
+    if (els.search.value) Interact.search(els.search.value);
+  }
+
+  function renderLegend() {
+    var seen = Object.create(null);
+    var items = [];
+    state.parsed.operations.forEach(function (op) {
+      if (seen[op.typeInfo.label]) return;
+      seen[op.typeInfo.label] = true;
+      items.push(op.typeInfo);
+    });
+    els.legend.innerHTML = items.map(function (info) {
+      return '<span class="legend-item"><i style="background:' + info.color + '"></i>' +
+        info.label.toLowerCase() + '</span>';
+    }).join('');
+  }
+
+  /* ---------- loading ---------- */
+
+  function loadObject(obj, sourceName) {
+    var parsed;
+    try {
+      parsed = Model.parse(obj);
+    } catch (err) {
+      toast(err.message, 'error');
+      return false;
+    }
+    state.parsed = parsed;
+    state.sourceName = sourceName || '';
+    els.title.textContent = parsed.title;
+    document.title = parsed.title + ' — Pipeline graph';
+    els.source.textContent = sourceName ? sourceName : '';
+    document.body.classList.add('has-graph');
+    Interact.closePanel();
+    els.search.value = '';
+    els.searchStatus.textContent = '';
+    render();
+    return true;
+  }
+
+  function loadText(txt, sourceName) {
+    var obj;
+    try {
+      obj = JSON.parse(txt);
+    } catch (err) {
+      toast('That file is not valid JSON — ' + err.message, 'error');
+      return false;
+    }
+    return loadObject(obj, sourceName);
+  }
+
+  function loadFile(file) {
+    if (!file) return;
+    var reader = new FileReader();
+    reader.onload = function () {
+      if (loadText(String(reader.result), file.name)) toast('Loaded ' + file.name, 'ok');
+    };
+    reader.onerror = function () { toast('Could not read that file.', 'error'); };
+    reader.readAsText(file);
+  }
+
+  /* ---------- wiring ---------- */
+
+  function init() {
+    els = {
+      svg: $('graph'), stage: $('stage'), panel: $('panel'),
+      title: $('title'), source: $('source'), stats: $('stats'),
+      legend: $('legend'), warnings: $('warnings'), toast: $('toast'),
+      search: $('search'), searchStatus: $('search-status'),
+      zoomLabel: $('zoom-label'), fileInput: $('file-input'),
+      dropOverlay: $('drop-overlay'), pasteModal: $('paste-modal'), pasteText: $('paste-text')
+    };
+
+    Interact.init({
+      svg: els.svg,
+      stage: els.stage,
+      panel: els.panel,
+      onStatus: function (s) {
+        if (s.zoom != null) els.zoomLabel.textContent = Math.round(s.zoom * 100) + '%';
+        if (s.search != null) els.searchStatus.textContent = s.search;
+      }
+    });
+
+    /* mode toggle */
+    Array.prototype.forEach.call(document.querySelectorAll('[data-mode]'), function (btn) {
+      btn.addEventListener('click', function () {
+        var mode = btn.getAttribute('data-mode');
+        if (mode === state.mode) return;
+        state.mode = mode;
+        Array.prototype.forEach.call(document.querySelectorAll('[data-mode]'), function (b) {
+          b.classList.toggle('is-active', b.getAttribute('data-mode') === mode);
+        });
+        if (state.parsed) render();
+      });
+    });
+
+    $('btn-fit').addEventListener('click', function () { Interact.fit(true); });
+    $('btn-zoom-in').addEventListener('click', function () { Interact.zoomBy(1.25); });
+    $('btn-zoom-out').addEventListener('click', function () { Interact.zoomBy(1 / 1.25); });
+
+    $('btn-load').addEventListener('click', function () { els.fileInput.click(); });
+    els.fileInput.addEventListener('change', function () {
+      loadFile(els.fileInput.files[0]);
+      els.fileInput.value = '';
+    });
+
+    /* paste modal */
+    $('btn-paste').addEventListener('click', function () {
+      els.pasteModal.classList.add('is-open');
+      els.pasteText.value = '';
+      els.pasteText.focus();
+    });
+    function closePaste() { els.pasteModal.classList.remove('is-open'); }
+    $('paste-cancel').addEventListener('click', closePaste);
+    $('paste-ok').addEventListener('click', function () {
+      if (loadText(els.pasteText.value, 'pasted JSON')) {
+        closePaste();
+        toast('Loaded pasted JSON', 'ok');
+      }
+    });
+    els.pasteModal.addEventListener('click', function (ev) {
+      if (ev.target === els.pasteModal) closePaste();
+    });
+
+    /* export */
+    $('btn-svg').addEventListener('click', function () {
+      if (!state.layout) { toast('Load a JSON first.', 'error'); return; }
+      Exporter.toSVG(els.svg, state.layout, filename('svg'));
+    });
+    $('btn-png').addEventListener('click', function () {
+      if (!state.layout) { toast('Load a JSON first.', 'error'); return; }
+      Exporter.toPNG(els.svg, state.layout, filename('png'), 2, function (err) {
+        toast(err.message, 'error');
+      });
+    });
+
+    /* search */
+    var searchTimer = null;
+    els.search.addEventListener('input', function () {
+      clearTimeout(searchTimer);
+      searchTimer = setTimeout(function () {
+        if (state.layout) Interact.search(els.search.value);
+      }, 160);
+    });
+    els.search.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Enter') {
+        ev.preventDefault();
+        Interact.nextHit();
+      } else if (ev.key === 'Escape') {
+        els.search.value = '';
+        Interact.search('');
+      }
+    });
+
+    /* drag and drop anywhere */
+    var dragDepth = 0;
+    window.addEventListener('dragenter', function (ev) {
+      ev.preventDefault();
+      dragDepth++;
+      els.dropOverlay.classList.add('is-open');
+    });
+    window.addEventListener('dragover', function (ev) { ev.preventDefault(); });
+    window.addEventListener('dragleave', function (ev) {
+      ev.preventDefault();
+      if (--dragDepth <= 0) { dragDepth = 0; els.dropOverlay.classList.remove('is-open'); }
+    });
+    window.addEventListener('drop', function (ev) {
+      ev.preventDefault();
+      dragDepth = 0;
+      els.dropOverlay.classList.remove('is-open');
+      var file = ev.dataTransfer && ev.dataTransfer.files && ev.dataTransfer.files[0];
+      if (file) loadFile(file);
+      else if (ev.dataTransfer) {
+        var txt = ev.dataTransfer.getData('text');
+        if (txt) loadText(txt, 'dropped text');
+      }
+    });
+
+    window.addEventListener('resize', function () {
+      if (state.layout) Interact.resize();
+    });
+
+    /* 1. baked-in data wins. 2. otherwise try sample.json, which only succeeds
+       over http:// — on file:// the fetch is blocked and we wait for a drop. */
+    if (global.__BAKED_DATA__) {
+      loadObject(global.__BAKED_DATA__, 'baked-in data');
+      return;
+    }
+    if (location.protocol !== 'file:' && global.fetch) {
+      fetch('sample.json')
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (obj) { if (obj && !state.parsed) loadObject(obj, 'sample.json'); })
+        .catch(function () { /* no sample alongside the page; that is fine */ });
+    }
+  }
+
+  function filename(ext) {
+    var base = (state.parsed && state.parsed.title ? state.parsed.title : 'pipeline')
+      .toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60);
+    return (base || 'pipeline') + '.' + ext;
+  }
+
+  document.addEventListener('DOMContentLoaded', init);
+  global.App = { state: state, loadObject: loadObject, loadText: loadText };
+})(window);
