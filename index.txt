@@ -25,6 +25,11 @@
       <button type="button" data-mode="explicit" title="Every step gets its own node">Explicit</button>
     </div>
 
+    <div class="segmented" role="group" aria-label="Flow direction">
+      <button type="button" data-direction="forward" class="is-active" title="Sources on top, outputs on bottom">Forward</button>
+      <button type="button" data-direction="reverse" title="Outputs on top, sources on bottom">Reverse</button>
+    </div>
+
     <div class="group" role="group" aria-label="Zoom">
       <button type="button" id="btn-zoom-out" title="Zoom out (−)">&minus;</button>
       <span id="zoom-label" class="zoom-label">100%</span>
