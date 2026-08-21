@@ -544,6 +544,7 @@
     closePanel: closePanel,
     search: search,
     nextHit: nextHit,
+    getSelection: function () { return S.selection ? S.selection.id : null; },
     getTransform: function () { return { k: S.k, tx: S.tx, ty: S.ty }; }
   };
 })(window);
