@@ -167,6 +167,40 @@
     return Array.isArray(v) ? v.slice() : [v];
   }
 
+  /* A dataset's "columns" can arrive in two shapes:
+       ["col1", "col2", ...]                          -> a list of column names
+       [{ "index":0, "Account_":"AI332I", ... }, ...] -> sample-data rows, where
+                                                         the object KEYS are the
+                                                         column names.
+     Normalise both to a plain list of column-name strings, and keep the sample
+     rows (when present) so their values can be surfaced later. A key literally
+     named "index" is treated as a row counter, not a column — if "index" is a
+     real column for you, remove it from IGNORED_COLUMN_KEYS below. */
+  var IGNORED_COLUMN_KEYS = { index: true };
+
+  function normalizeColumns(raw) {
+    var arr = toArray(raw);
+    var rows = arr.filter(function (x) {
+      return x && typeof x === 'object' && !Array.isArray(x);
+    });
+
+    if (rows.length) {
+      var names = [];
+      var seen = Object.create(null);
+      rows.forEach(function (row) {
+        Object.keys(row).forEach(function (k) {
+          if (IGNORED_COLUMN_KEYS[k] || seen[k]) return;
+          seen[k] = true;
+          names.push(k);
+        });
+      });
+      return { columns: names, sampleRows: rows };
+    }
+
+    // Plain list of names (strings or numbers).
+    return { columns: arr.map(String), sampleRows: null };
+  }
+
   function parse(raw) {
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
       throw new Error('Top-level JSON must be an object with "datasets" and "operations".');
@@ -186,12 +220,14 @@
         warnings.push('Duplicate dataset id "' + id + '" — keeping the first definition.');
         return;
       }
+      var colInfo = normalizeColumns(d && d.columns);
       datasets[id] = {
         id: id,
         name: d && d.name != null ? String(d.name) : id,
         description: d && d.description != null ? String(d.description) : '',
         tags: toArray(d && d.tags).map(String),
-        columns: toArray(d && d.columns).map(String),
+        columns: colInfo.columns,
+        sampleRows: colInfo.sampleRows,
         missing: false
       };
       dsOrder.push(id);
@@ -206,6 +242,7 @@
         description: 'This dataset id is referenced by an operation but never defined in "datasets".',
         tags: [],
         columns: [],
+        sampleRows: null,
         missing: true
       };
       dsOrder.push(id);
@@ -328,4 +365,71 @@
     /* Parallel badged edges between the same pair would stack; fan their labels out. */
     var pairs = Object.create(null);
     edges.forEach(function (e) {
-      var k = e.from + '
+      var k = e.from + ' ' + e.to;
+      (pairs[k] || (pairs[k] = [])).push(e);
+    });
+    Object.keys(pairs).forEach(function (k) {
+      var group = pairs[k];
+      if (group.length < 2) return;
+      group.forEach(function (e, i) { e.t = (i + 1) / (group.length + 1); });
+    });
+
+    /* Adjacency + roles. */
+    var succ = Object.create(null);
+    var pred = Object.create(null);
+    nodes.forEach(function (n) { succ[n.id] = []; pred[n.id] = []; });
+    edges.forEach(function (e) {
+      succ[e.from].push(e);
+      pred[e.to].push(e);
+    });
+    nodes.forEach(function (n) {
+      if (n.kind === 'op') { n.role = 'op'; return; }
+      if (n.kind === 'missing') { n.role = 'missing'; return; }
+      var tags = n.data.tags.map(function (t) { return t.toLowerCase(); });
+      if (!pred[n.id].length || tags.indexOf('input') >= 0 || tags.indexOf('source') >= 0) n.role = 'source';
+      else if (!succ[n.id].length || tags.indexOf('output') >= 0) n.role = 'output';
+      else n.role = 'intermediate';
+      // A node with successors is never a terminal output, whatever its tags say.
+      if (n.role === 'output' && succ[n.id].length && pred[n.id].length) n.role = 'intermediate';
+    });
+
+    return { nodes: nodes, byId: byId, edges: edges, succ: succ, pred: pred, mode: compact ? 'compact' : 'explicit' };
+  }
+
+  /* Datasets/ops reachable upstream and downstream of a node. */
+  function lineage(graph, startId) {
+    function walk(adjacency, key) {
+      var seen = Object.create(null);
+      var stack = [startId];
+      while (stack.length) {
+        var cur = stack.pop();
+        (adjacency[cur] || []).forEach(function (e) {
+          var next = e[key];
+          if (seen[next]) return;
+          seen[next] = true;
+          stack.push(next);
+        });
+      }
+      delete seen[startId];
+      return seen;
+    }
+    return { up: walk(graph.pred, 'from'), down: walk(graph.succ, 'to') };
+  }
+
+  global.Model = {
+    parse: parse,
+    buildGraph: buildGraph,
+    lineage: lineage,
+    typeInfo: typeInfo,
+    measure: measure,
+    wrapText: wrapText,
+    FONT_STACK: FONT_STACK,
+    FONT_NAME: FONT_NAME,
+    FONT_META: FONT_META,
+    FONT_OP: FONT_OP,
+    FONT_BADGE: FONT_BADGE,
+    DS_PAD_X: DS_PAD_X,
+    DS_ACCENT: DS_ACCENT,
+    DS_LINE_H: DS_LINE_H
+  };
+})(window);
