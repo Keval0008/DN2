@@ -361,6 +361,51 @@ body.has-graph .empty { display: none; }
 .columns li { padding-left: 2px; }
 .columns li::marker { color: var(--ink-faint); font-size: 10px; }
 
+/* sample-data preview table — shown in place of the column list when a
+   dataset's "columns" arrived as row objects carrying values. */
+.sample-wrap {
+  overflow: auto;
+  max-height: 320px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.sample-table {
+  border-collapse: collapse;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  white-space: nowrap;
+  min-width: 100%;
+}
+
+.sample-table th,
+.sample-table td {
+  padding: 5px 10px;
+  text-align: left;
+  border-bottom: 1px solid var(--line);
+  border-right: 1px solid var(--line);
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sample-table th:last-child,
+.sample-table td:last-child { border-right: 0; }
+
+.sample-table thead th {
+  position: sticky;
+  top: 0;
+  background: #f6f8fb;
+  color: var(--ink-soft);
+  font-weight: 600;
+}
+
+.sample-table tbody td { color: var(--ink-soft); }
+.sample-table tbody tr:nth-child(even) { background: #fafbfd; }
+.sample-table tbody tr:last-child td { border-bottom: 0; }
+
+.sample-more { margin: 6px 0 0; }
+
 /* ---------- overlays ---------- */
 
 .drop-overlay {
