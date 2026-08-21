@@ -7,6 +7,7 @@
     layout: null,
     refs: null,
     mode: 'compact',
+    direction: 'forward',
     sourceName: ''
   };
 
@@ -44,7 +45,7 @@
   function render(preserveSelection) {
     if (!state.parsed) return;
     var graph = Model.buildGraph(state.parsed, state.mode);
-    var layout = Layout.compute(graph);
+    var layout = Layout.compute(graph, state.direction);
     var refs = Render.draw(els.svg, layout, {
       onNodeClick: function (node) { Interact.selectNode(node); },
       onOpClick: function (op) { Interact.selectOp(op); }
@@ -162,6 +163,22 @@
           b.classList.toggle('is-active', b.getAttribute('data-mode') === mode);
         });
         if (state.parsed) render();
+      });
+    });
+
+    /* direction toggle */
+    Array.prototype.forEach.call(document.querySelectorAll('[data-direction]'), function (btn) {
+      btn.addEventListener('click', function () {
+        var dir = btn.getAttribute('data-direction');
+        if (dir === state.direction) return;
+        state.direction = dir;
+        Array.prototype.forEach.call(document.querySelectorAll('[data-direction]'), function (b) {
+          b.classList.toggle('is-active', b.getAttribute('data-direction') === dir);
+        });
+        if (state.parsed) {
+          var keep = Interact.getSelection ? Interact.getSelection() : null;
+          render(keep);
+        }
       });
     });
 
