@@ -316,7 +316,8 @@
 
   /* ---------- entry point ---------- */
 
-  function compute(graph) {
+  function compute(graph, direction) {
+    var reverse = direction === 'reverse';
     var ranked = rankNodes(graph);
     var layers = insertDummies(graph, ranked.rank);
     var adj = buildLayoutAdjacency(graph, layers);
@@ -341,12 +342,28 @@
 
     routeEdges(graph);
 
+    var width = (maxX - minX) + PADDING * 2;
+    var height = (maxY - minY) + PADDING * 2;
+
+    // Reverse direction: mirror the finished geometry vertically so outputs sit
+    // on top and sources on the bottom. Because it's a pure mirror, the arrows
+    // stay attached and simply point upward (data still flows source -> output),
+    // and the horizontal arrangement / crossing counts are unchanged.
+    if (reverse) {
+      graph.nodes.forEach(function (n) { n.y = height - n.y; });
+      graph.edges.forEach(function (e) {
+        if (e.points) e.points.forEach(function (p) { p.y = height - p.y; });
+        if (e.labelPoint) e.labelPoint.y = height - e.labelPoint.y;
+      });
+    }
+
     return {
       graph: graph,
       layers: layers,
       cyclic: ranked.cyclic,
-      width: (maxX - minX) + PADDING * 2,
-      height: (maxY - minY) + PADDING * 2
+      direction: reverse ? 'reverse' : 'forward',
+      width: width,
+      height: height
     };
   }
 
