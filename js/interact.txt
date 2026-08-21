@@ -310,21 +310,43 @@
     showPanel(html);
   }
 
-  function renderOpPanel(op) {
-    function dsLabel(id) {
-      var d = S.parsed.datasets[id];
-      return { id: id, label: d ? d.name : id };
+  /* One input/output dataset inside an operation panel: its name (clickable),
+     column count, and its data table (or column list) when it has any. */
+  function ioDatasetBlock(id) {
+    var ds = S.parsed.datasets[id];
+    if (!ds) {
+      return '<div class="io-block"><div class="io-head">' +
+        '<button type="button" class="link io-name" data-select="' + esc(id) + '">' + esc(id) + '</button>' +
+        '</div><p class="muted">Unknown dataset.</p></div>';
     }
+    var count = ds.columns.length + (ds.columns.length === 1 ? ' col' : ' cols');
+    var body = ds.columns.length ? columnsView(ds) : '';
+    return '<div class="io-block">' +
+      '<div class="io-head">' +
+        '<button type="button" class="link io-name" data-select="' + esc(ds.id) + '">' + esc(ds.name) + '</button>' +
+        '<span class="io-count">' + count + '</span>' +
+      '</div>' + body +
+    '</div>';
+  }
+
+  function renderOpPanel(op) {
+    var typeChip = '<span class="chip type-chip" style="background:' + op.typeInfo.tint +
+      ';color:' + op.typeInfo.color + '">' + esc(op.typeInfo.label) + '</span>';
+    var inputs = op.from.length ? op.from.map(ioDatasetBlock).join('') : '<p class="muted">None</p>';
+    var outputs = op.to.length ? op.to.map(ioDatasetBlock).join('') : '<p class="muted">None</p>';
+
     var html = '' +
       '<button type="button" class="panel-close" data-close aria-label="Close panel">&times;</button>' +
-      '<p class="kicker" style="color:' + op.typeInfo.color + '">' + esc(op.typeInfo.label) + '</p>' +
-      '<h2>' + esc(op.name) + '</h2>' +
+      '<p class="kicker">Operation</p>' +
+      '<h3>Input data <span class="count">' + op.from.length + '</span></h3>' +
+      inputs +
+      '<h3>Operation</h3>' +
+      '<h2 class="op-title">' + esc(op.name) + '</h2>' +
+      '<div class="chips">' + typeChip + '</div>' +
       '<p class="mono-id">' + esc(op.id) + '</p>' +
       (op.detail ? '<p class="desc">' + esc(op.detail) + '</p>' : '') +
-      '<h3>Inputs <span class="count">' + op.from.length + '</span></h3>' +
-      linkList(op.from.map(dsLabel)) +
-      '<h3>Output <span class="count">' + op.to.length + '</span></h3>' +
-      linkList(op.to.map(dsLabel));
+      '<h3>Output data <span class="count">' + op.to.length + '</span></h3>' +
+      outputs;
     showPanel(html);
   }
 
