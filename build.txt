@@ -1,0 +1,26 @@
+@echo off
+REM build.bat - installs the two dependencies and builds the exe.
+REM Place this next to launcher.py and the app\ folder, then double-click it
+REM (or run it from a terminal). Needs Python + pip on PATH.
+
+echo Installing pywebview and pyinstaller...
+pip install pywebview pyinstaller
+if errorlevel 1 goto :error
+
+echo.
+echo Building the exe...
+pyinstaller --onefile --windowed --name PipelineGraph --add-data "app;app" launcher.py
+if errorlevel 1 goto :error
+
+echo.
+echo ============================================================
+echo  Done. Your exe is here:  dist\PipelineGraph.exe
+echo ============================================================
+pause
+exit /b 0
+
+:error
+echo.
+echo Build failed - see the messages above.
+pause
+exit /b 1
