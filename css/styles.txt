@@ -436,6 +436,30 @@ body.is-resizing-panel { cursor: col-resize; user-select: none; }
 
 .sample-more { margin: 6px 0 0; }
 
+/* operation panel: input / output dataset blocks */
+.io-block { margin: 0 0 16px; }
+.io-block:last-child { margin-bottom: 0; }
+
+.io-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 0 0 6px;
+}
+
+.io-name { font-weight: 600; font-size: 13px; padding: 0; }
+
+.io-count {
+  flex: none;
+  font-size: 10.5px;
+  color: var(--ink-faint);
+  font-family: var(--mono);
+}
+
+.op-title { margin-top: 2px; }
+.type-chip { letter-spacing: .5px; }
+
 /* ---------- overlays ---------- */
 
 .drop-overlay {
