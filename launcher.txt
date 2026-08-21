@@ -1,0 +1,45 @@
+"""launcher.py — open the pipeline-graph web app in a native desktop window.
+
+This does NOT touch the web app. It just points pywebview at the existing
+app/index.html, whose css/ and js/ load relative to it exactly as before.
+
+Run in dev:   python launcher.py
+Build an exe: see build.bat (or the pyinstaller command in the README)
+"""
+
+import os
+import sys
+import webview
+
+
+def resource_path(relative):
+    """Absolute path to a bundled file, working both in dev and once frozen.
+
+    PyInstaller's --onefile extracts bundled data to a temp dir it exposes as
+    sys._MEIPASS; in plain `python launcher.py` we fall back to this file's dir.
+    """
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, relative)
+
+
+def main():
+    index = resource_path(os.path.join("app", "index.html"))
+    if not os.path.isfile(index):
+        # Clear message instead of a blank window if the app folder wasn't bundled.
+        sys.stderr.write("Could not find app/index.html next to the launcher.\n")
+        sys.exit(1)
+
+    webview.create_window(
+        "Pipeline Graph",
+        index,
+        width=1280,
+        height=820,
+        min_size=(720, 480),
+    )
+    # gui is auto-detected (EdgeChromium/WebView2 on Windows). To force it:
+    # webview.start(gui="edgechromium")
+    webview.start()
+
+
+if __name__ == "__main__":
+    main()
