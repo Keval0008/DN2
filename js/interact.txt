@@ -12,8 +12,22 @@
     k: 1, tx: 0, ty: 0,
     selection: null,
     hits: [], hitIndex: -1,
-    onStatus: null
+    onStatus: null,
+    resizer: null, panelWidth: null
   };
+
+  // The side panel is drag-resizable between 25% of the workspace and (almost)
+  // its full width. This handle sits between the stage and the panel.
+  var RESIZER_W = 6;
+
+  function clampPanelWidth(px) {
+    var ws = S.panel && S.panel.parentNode;
+    var avail = ws ? ws.clientWidth : window.innerWidth;
+    var min = avail * 0.25;
+    var max = avail - RESIZER_W; // keep the handle itself grabbable at full width
+    if (max < min) max = min;
+    return Math.max(min, Math.min(max, px));
+  }
 
   function esc(str) {
     return String(str == null ? '' : str)
@@ -253,6 +267,8 @@
   function showPanel(html) {
     S.panel.innerHTML = html;
     S.panel.classList.add('is-open');
+    if (S.resizer) S.resizer.style.display = '';
+    S.panel.style.width = clampPanelWidth(S.panelWidth || 340) + 'px';
     S.panel.scrollTop = 0;
     Array.prototype.forEach.call(S.panel.querySelectorAll('[data-select]'), function (btn) {
       btn.addEventListener('click', function () { selectById(btn.getAttribute('data-select')); });
@@ -264,6 +280,8 @@
   function closePanel() {
     S.panel.classList.remove('is-open');
     S.panel.innerHTML = '';
+    S.panel.style.width = '';
+    if (S.resizer) S.resizer.style.display = 'none';
     clearFocus();
   }
 
@@ -445,7 +463,61 @@
       else if (ev.key === '-' || ev.key === '_') { zoomBy(1 / 1.2); }
     });
 
-    window.addEventListener('resize', function () { resize(); });
+    // ---- resizable side panel ----
+    var resizer = document.createElement('div');
+    resizer.className = 'panel-resizer';
+    resizer.setAttribute('role', 'separator');
+    resizer.setAttribute('aria-orientation', 'vertical');
+    resizer.setAttribute('aria-label', 'Resize panel');
+    resizer.style.display = 'none';
+    if (S.panel && S.panel.parentNode) S.panel.parentNode.insertBefore(resizer, S.panel);
+    S.resizer = resizer;
+
+    var rdrag = null;
+    resizer.addEventListener('pointerdown', function (ev) {
+      ev.preventDefault();
+      rdrag = { id: ev.pointerId };
+      resizer.classList.add('is-active');
+      S.panel.classList.add('is-resizing');
+      document.body.classList.add('is-resizing-panel');
+      try { resizer.setPointerCapture(ev.pointerId); } catch (e) { /* pointer gone */ }
+    });
+    resizer.addEventListener('pointermove', function (ev) {
+      if (!rdrag) return;
+      var ws = S.panel.parentNode;
+      var rect = ws.getBoundingClientRect();
+      // Panel is docked right: its width is the distance from the pointer to the
+      // workspace's right edge.
+      var w = clampPanelWidth(rect.right - ev.clientX);
+      S.panelWidth = w;
+      S.panel.style.width = w + 'px';
+      resize(); // keep the SVG viewport matched to the changing stage size
+    });
+    function endResize(ev) {
+      if (!rdrag) return;
+      var id = rdrag.id;
+      rdrag = null;
+      resizer.classList.remove('is-active');
+      S.panel.classList.remove('is-resizing');
+      document.body.classList.remove('is-resizing-panel');
+      if (resizer.hasPointerCapture && resizer.hasPointerCapture(id)) resizer.releasePointerCapture(id);
+      resize();
+    }
+    resizer.addEventListener('pointerup', endResize);
+    resizer.addEventListener('pointercancel', endResize);
+    // Double-click the handle to snap back to the default width.
+    resizer.addEventListener('dblclick', function () {
+      S.panelWidth = null;
+      S.panel.style.width = clampPanelWidth(340) + 'px';
+      resize();
+    });
+
+    window.addEventListener('resize', function () {
+      resize();
+      if (S.panel.classList.contains('is-open')) {
+        S.panel.style.width = clampPanelWidth(S.panelWidth || 340) + 'px';
+      }
+    });
   }
 
   function setGraph(layout, refs, parsed) {
