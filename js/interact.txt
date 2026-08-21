@@ -206,6 +206,50 @@
     }).join('') + '</ul>';
   }
 
+  /* Render a single sample-data cell value as text. */
+  function cellText(v) {
+    if (v == null) return '';
+    if (typeof v === 'object') {
+      try { return JSON.stringify(v); } catch (e) { return String(v); }
+    }
+    return String(v);
+  }
+
+  /* The dataset's columns block: a plain list normally, but a small preview
+     table when the dataset carried sample rows (columns given as row objects). */
+  function columnsView(ds) {
+    if (!ds.columns.length) return '<p class="muted">No columns listed.</p>';
+
+    if (!ds.sampleRows || !ds.sampleRows.length) {
+      return '<ol class="columns">' + ds.columns.map(function (c) {
+        return '<li>' + esc(c) + '</li>';
+      }).join('') + '</ol>';
+    }
+
+    var MAX_ROWS = 12;
+    var cols = ds.columns;
+    var rows = ds.sampleRows;
+    var shown = rows.slice(0, MAX_ROWS);
+
+    var head = '<tr>' + cols.map(function (c) {
+      return '<th>' + esc(c) + '</th>';
+    }).join('') + '</tr>';
+
+    var body = shown.map(function (row) {
+      return '<tr>' + cols.map(function (c) {
+        var val = cellText(row[c]);
+        return '<td title="' + esc(val) + '">' + esc(val) + '</td>';
+      }).join('') + '</tr>';
+    }).join('');
+
+    var note = rows.length > MAX_ROWS
+      ? '<p class="muted sample-more">Showing ' + MAX_ROWS + ' of ' + rows.length + ' rows.</p>'
+      : '';
+
+    return '<div class="sample-wrap"><table class="sample-table">' +
+      '<thead>' + head + '</thead><tbody>' + body + '</tbody></table></div>' + note;
+  }
+
   function showPanel(html) {
     S.panel.innerHTML = html;
     S.panel.classList.add('is-open');
@@ -244,11 +288,7 @@
         return { id: op.id, label: op.typeInfo.label + ' · ' + op.name };
       })) +
       '<h3>Columns <span class="count">' + ds.columns.length + '</span></h3>' +
-      (ds.columns.length
-        ? '<ol class="columns">' + ds.columns.map(function (c) {
-            return '<li>' + esc(c) + '</li>';
-          }).join('') + '</ol>'
-        : '<p class="muted">No columns listed.</p>');
+      columnsView(ds);
     showPanel(html);
   }
 
