@@ -26,8 +26,8 @@
     </div>
 
     <div class="segmented" role="group" aria-label="Flow direction">
-      <button type="button" data-direction="forward" class="is-active" title="Sources on top, outputs on bottom">Forward</button>
-      <button type="button" data-direction="reverse" title="Outputs on top, sources on bottom">Reverse</button>
+      <button type="button" data-direction="forward" title="Sources on top, outputs on bottom">Forward</button>
+      <button type="button" data-direction="reverse" class="is-active" title="Outputs on top, sources on bottom">Reverse</button>
     </div>
 
     <div class="group" role="group" aria-label="Zoom">
