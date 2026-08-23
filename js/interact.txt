@@ -335,18 +335,25 @@
     var inputs = op.from.length ? op.from.map(ioDatasetBlock).join('') : '<p class="muted">None</p>';
     var outputs = op.to.length ? op.to.map(ioDatasetBlock).join('') : '<p class="muted">None</p>';
 
-    var html = '' +
-      '<button type="button" class="panel-close" data-close aria-label="Close panel">&times;</button>' +
-      '<p class="kicker">Operation</p>' +
-      '<h3>Input data <span class="count">' + op.from.length + '</span></h3>' +
-      inputs +
+    var inputSection = '<h3>Input data <span class="count">' + op.from.length + '</span></h3>' + inputs;
+    var outputSection = '<h3>Output data <span class="count">' + op.to.length + '</span></h3>' + outputs;
+    var opSection =
       '<h3>Operation</h3>' +
       '<h2 class="op-title">' + esc(op.name) + '</h2>' +
       '<div class="chips">' + typeChip + '</div>' +
       '<p class="mono-id">' + esc(op.id) + '</p>' +
-      (op.detail ? '<p class="desc">' + esc(op.detail) + '</p>' : '') +
-      '<h3>Output data <span class="count">' + op.to.length + '</span></h3>' +
-      outputs;
+      (op.detail ? '<p class="desc">' + esc(op.detail) + '</p>' : '');
+
+    // Match the graph: reverse direction puts outputs on top, so the panel does too.
+    var reverse = S.layout && S.layout.direction === 'reverse';
+    var flow = reverse
+      ? outputSection + opSection + inputSection
+      : inputSection + opSection + outputSection;
+
+    var html = '' +
+      '<button type="button" class="panel-close" data-close aria-label="Close panel">&times;</button>' +
+      '<p class="kicker">Operation</p>' +
+      flow;
     showPanel(html);
   }
 
