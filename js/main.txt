@@ -7,7 +7,7 @@
     layout: null,
     refs: null,
     mode: 'compact',
-    direction: 'forward',
+    direction: 'reverse',
     sourceName: ''
   };
 
