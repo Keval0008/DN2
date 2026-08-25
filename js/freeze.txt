@@ -1,0 +1,258 @@
+/* freeze.js — "Save HTML": export the current view as a standalone, locked HTML
+   file. It contains the graph + click-to-open side panel only; the data and the
+   chosen Compact/Explicit + Forward/Reverse state are baked in and unchangeable.
+   No toolbar toggles, no image export, no JSON loading. Exposes window.Freeze. */
+(function (global) {
+  'use strict';
+
+  function escHTML(s) {
+    return String(s == null ? '' : s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  // Keep an embedded payload / source from terminating the surrounding <script>,
+  // and keep line separators legal inside a JS string.
+  function escapeForScript(s) {
+    return String(s)
+      .replace(/<\/(script)/gi, '<\\/$1')
+      .replace(/<!--/g, '<\\!--')
+      .replace(/\u2028/g, '\\u2028')
+      .replace(/\u2029/g, '\\u2029');
+  }
+
+  function collectPageCSS() {
+    var out = [];
+    var sheets = document.styleSheets;
+    for (var i = 0; i < sheets.length; i++) {
+      var rules = null;
+      try { rules = sheets[i].cssRules; } catch (e) { rules = null; }
+      if (!rules) continue;
+      for (var j = 0; j < rules.length; j++) out.push(rules[j].cssText);
+    }
+    return out.join('\n');
+  }
+
+  // A print-ready, interactive clone of the graph: no transient UI state, no
+  // viewport transform (the frozen runtime drives pan/zoom fresh). The graph's
+  // own <style> and <defs> ride along inside the SVG, so it is self-contained.
+  function cloneGraphSVG(svg) {
+    var clone = svg.cloneNode(true);
+    Array.prototype.forEach.call(
+      clone.querySelectorAll('.is-focus,.is-up,.is-down,.is-hit,.is-hit-active,.is-lineage'),
+      function (n) { n.classList.remove('is-focus', 'is-up', 'is-down', 'is-hit', 'is-hit-active', 'is-lineage'); }
+    );
+    Array.prototype.forEach.call(clone.querySelectorAll('.edge-hit'), function (n) {
+      if (n.parentNode) n.parentNode.removeChild(n);
+    });
+    var vp = clone.querySelector('.viewport');
+    if (vp) { vp.removeAttribute('transform'); vp.classList.remove('has-focus'); }
+    clone.removeAttribute('width');
+    clone.removeAttribute('height');
+    clone.removeAttribute('viewBox');
+    return new XMLSerializer().serializeToString(clone);
+  }
+
+  function rolesFrom(layout) {
+    var roles = {};
+    var byId = layout.graph.byId;
+    Object.keys(byId).forEach(function (id) {
+      if (byId[id].kind !== 'op') roles[id] = { role: byId[id].role };
+    });
+    return roles;
+  }
+
+  /* The runtime embedded in the exported file. Written as a real function so it
+     can be linted/tested; it is serialised with toString() at export time, and
+     the exact panel-rendering functions are spliced in at the marker. */
+  function frozenRuntime() {
+    'use strict';
+    var B = window.__FROZEN__;
+    var S = {
+      parsed: { datasets: B.datasets, operations: B.operations },
+      layout: { direction: B.direction, graph: { byId: B.roles } }
+    };
+    var opById = {};
+    B.operations.forEach(function (o) { opById[o.id] = o; });
+
+    /*__PANEL_FNS__*/
+
+    var panel = document.getElementById('panel');
+    var stage = document.getElementById('stage');
+    var svg = stage.querySelector('svg');
+    var vp = svg.querySelector('.viewport');
+
+    function showPanel(html) {
+      panel.innerHTML = html;
+      panel.classList.add('is-open');
+      panel.style.width = Math.max(340, Math.round((window.innerWidth || 1200) * 0.3)) + 'px';
+      panel.scrollTop = 0;
+      Array.prototype.forEach.call(panel.querySelectorAll('[data-select]'), function (btn) {
+        btn.addEventListener('click', function () { selectById(btn.getAttribute('data-select')); });
+      });
+      var close = panel.querySelector('[data-close]');
+      if (close) close.addEventListener('click', closePanel);
+    }
+    function closePanel() {
+      panel.classList.remove('is-open');
+      panel.innerHTML = '';
+      panel.style.width = '';
+    }
+    function selectById(id) {
+      if (S.parsed.datasets[id]) renderDatasetPanel(S.parsed.datasets[id]);
+      else if (opById[id]) renderOpPanel(opById[id]);
+    }
+
+    // ---- pan / zoom ----
+    var k = 1, tx = 0, ty = 0;
+    var MINK = 0.12, MAXK = 4;
+    function apply() {
+      vp.setAttribute('transform', 'translate(' + tx.toFixed(2) + ',' + ty.toFixed(2) + ') scale(' + k.toFixed(4) + ')');
+    }
+    function resize() {
+      var w = stage.clientWidth || 1, h = stage.clientHeight || 1;
+      svg.setAttribute('width', w);
+      svg.setAttribute('height', h);
+      svg.setAttribute('viewBox', '0 0 ' + w + ' ' + h);
+    }
+    function fit() {
+      resize();
+      var cw = stage.clientWidth || 1, ch = stage.clientHeight || 1;
+      var s = Math.min(cw / B.layout.width, ch / B.layout.height, 1);
+      s = Math.max(MINK, Math.min(MAXK, s));
+      k = s; tx = (cw - B.layout.width * s) / 2; ty = (ch - B.layout.height * s) / 2;
+      apply();
+    }
+    function zoomAt(px, py, f) {
+      var nk = Math.max(MINK, Math.min(MAXK, k * f));
+      if (nk === k) return;
+      tx = px - (px - tx) * (nk / k);
+      ty = py - (py - ty) * (nk / k);
+      k = nk; apply();
+    }
+    function zoomBy(f) { zoomAt((stage.clientWidth || 1) / 2, (stage.clientHeight || 1) / 2, f); }
+
+    stage.addEventListener('wheel', function (ev) {
+      ev.preventDefault();
+      var r = stage.getBoundingClientRect();
+      zoomAt(ev.clientX - r.left, ev.clientY - r.top, Math.exp(-ev.deltaY * 0.0016));
+    }, { passive: false });
+
+    var drag = null;
+    stage.addEventListener('pointerdown', function (ev) {
+      if (ev.button !== 0) return;
+      drag = { x: ev.clientX, y: ev.clientY, tx: tx, ty: ty, moved: false, id: ev.pointerId };
+    });
+    stage.addEventListener('pointermove', function (ev) {
+      if (!drag) return;
+      var dx = ev.clientX - drag.x, dy = ev.clientY - drag.y;
+      if (!drag.moved) {
+        if (Math.abs(dx) + Math.abs(dy) <= 3) return;
+        drag.moved = true; stage.classList.add('is-panning');
+        try { stage.setPointerCapture(drag.id); } catch (e) { /* gone */ }
+      }
+      tx = drag.tx + dx; ty = drag.ty + dy; apply();
+    });
+    function endDrag() {
+      if (!drag) return;
+      var moved = drag.moved, id = drag.id;
+      drag = null; stage.classList.remove('is-panning');
+      if (stage.hasPointerCapture && stage.hasPointerCapture(id)) stage.releasePointerCapture(id);
+      if (moved) {
+        var sw = function (e) { e.stopPropagation(); };
+        stage.addEventListener('click', sw, { capture: true, once: true });
+      }
+    }
+    stage.addEventListener('pointerup', endDrag);
+    stage.addEventListener('pointercancel', endDrag);
+
+    stage.addEventListener('click', function (ev) {
+      var nodeEl = ev.target.closest && ev.target.closest('[data-node]');
+      if (nodeEl) {
+        var id = nodeEl.getAttribute('data-node');
+        selectById(id.indexOf('op:') === 0 ? id.slice(3) : id);
+        return;
+      }
+      var badge = ev.target.closest && ev.target.closest('[data-op]');
+      if (badge) { selectById(badge.getAttribute('data-op')); return; }
+      closePanel();
+    });
+
+    document.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Escape') closePanel();
+      else if (ev.key === '0') fit();
+      else if (ev.key === '+' || ev.key === '=') zoomBy(1.2);
+      else if (ev.key === '-' || ev.key === '_') zoomBy(1 / 1.2);
+    });
+
+    function on(id, fn) { var el = document.getElementById(id); if (el) el.addEventListener('click', fn); }
+    on('fz-out', function () { zoomBy(1 / 1.25); });
+    on('fz-in', function () { zoomBy(1.25); });
+    on('fz-fit', fit);
+
+    window.addEventListener('resize', resize);
+    fit();
+  }
+
+  function toHTML(opts) {
+    var svg = opts.svg, layout = opts.layout, parsed = opts.parsed;
+
+    var baked = {
+      title: parsed.title,
+      direction: opts.direction === 'reverse' ? 'reverse' : 'forward',
+      layout: { width: Math.ceil(layout.width), height: Math.ceil(layout.height) },
+      datasets: parsed.datasets,
+      operations: parsed.operations,
+      roles: rolesFrom(layout)
+    };
+
+    var fns = Interact.exportPanelFns();
+    var fnSrc = Object.keys(fns).map(function (name) { return fns[name].toString() + '\n'; }).join('');
+
+    var runtimeSrc = frozenRuntime.toString().replace('/*__PANEL_FNS__*/', fnSrc);
+    var runtime = escapeForScript('(' + runtimeSrc + ')();');
+    var payload = escapeForScript(JSON.stringify(baked));
+
+    var css = collectPageCSS();
+    var svgStr = cloneGraphSVG(svg);
+    var title = parsed.title || 'Pipeline graph';
+
+    var dsCount = parsed.datasetOrder.length;
+    var opCount = parsed.operations.length;
+    var stats = dsCount + (dsCount === 1 ? ' dataset' : ' datasets') + ' · ' +
+                opCount + (opCount === 1 ? ' operation' : ' operations');
+
+    var closeScript = '<\/script>';
+
+    return '<!DOCTYPE html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n' +
+      '<meta name="viewport" content="width=device-width, initial-scale=1">\n' +
+      '<title>' + escHTML(title) + '</title>\n<style>\n' + css + '\n</style>\n</head>\n' +
+      '<body class="has-graph frozen">\n' +
+      '<header class="topbar frozen-bar">\n' +
+      '  <div class="titles"><h1>' + escHTML(title) + '</h1>' +
+      '<p class="sub"><span>' + escHTML(stats) + '</span></p></div>\n' +
+      '  <div class="tools"><div class="group" role="group" aria-label="Zoom">' +
+      '<button type="button" id="fz-out" title="Zoom out (\u2212)">&minus;</button>' +
+      '<button type="button" id="fz-fit" title="Fit (0)">Fit</button>' +
+      '<button type="button" id="fz-in" title="Zoom in (+)">+</button>' +
+      '</div></div>\n</header>\n' +
+      '<main class="workspace">\n  <div id="stage" class="stage">' + svgStr + '</div>\n' +
+      '  <aside id="panel" class="panel" aria-live="polite"></aside>\n</main>\n' +
+      '<script>window.__FROZEN__ = ' + payload + ';' + closeScript + '\n' +
+      '<script>' + runtime + closeScript + '\n' +
+      '</body>\n</html>\n';
+  }
+
+  function download(html, filename) {
+    var blob = new Blob([html], { type: 'text/html;charset=utf-8' });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url;
+    a.download = filename || 'pipeline.html';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(function () { URL.revokeObjectURL(url); }, 4000);
+  }
+
+  global.Freeze = { toHTML: toHTML, download: download };
+})(window);
