@@ -222,6 +222,19 @@
       });
     });
 
+    $('btn-html').addEventListener('click', function () {
+      if (!state.layout) { toast('Load a JSON first.', 'error'); return; }
+      try {
+        var html = Freeze.toHTML({
+          svg: els.svg, layout: state.layout, parsed: state.parsed, direction: state.direction
+        });
+        Freeze.download(html, filename('html'));
+        toast('Saved standalone HTML', 'ok');
+      } catch (err) {
+        toast('Could not build HTML — ' + err.message, 'error');
+      }
+    });
+
     /* search */
     var searchTimer = null;
     els.search.addEventListener('input', function () {
