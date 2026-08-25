@@ -84,7 +84,8 @@
     function showPanel(html) {
       panel.innerHTML = html;
       panel.classList.add('is-open');
-      panel.style.width = Math.max(340, Math.round((window.innerWidth || 1200) * 0.3)) + 'px';
+      if (resizer) resizer.style.display = '';
+      panel.style.width = clampW(panelWidth || (window.innerWidth || 1200) * 0.65) + 'px';
       panel.scrollTop = 0;
       Array.prototype.forEach.call(panel.querySelectorAll('[data-select]'), function (btn) {
         btn.addEventListener('click', function () { selectById(btn.getAttribute('data-select')); });
@@ -96,6 +97,7 @@
       panel.classList.remove('is-open');
       panel.innerHTML = '';
       panel.style.width = '';
+      if (resizer) resizer.style.display = 'none';
     }
     function selectById(id) {
       if (S.parsed.datasets[id]) renderDatasetPanel(S.parsed.datasets[id]);
@@ -189,7 +191,59 @@
     on('fz-in', function () { zoomBy(1.25); });
     on('fz-fit', fit);
 
-    window.addEventListener('resize', resize);
+    // ---- resizable side panel (drag the handle; 25%..full width, opens at 65%) ----
+    var RESIZER_W = 6, panelWidth = null;
+    function clampW(px) {
+      var ws = panel.parentNode;
+      var avail = ws ? ws.clientWidth : (window.innerWidth || 1200);
+      var min = avail * 0.25, max = avail - RESIZER_W;
+      if (max < min) max = min;
+      return Math.max(min, Math.min(max, px));
+    }
+    var resizer = document.createElement('div');
+    resizer.className = 'panel-resizer';
+    resizer.setAttribute('role', 'separator');
+    resizer.setAttribute('aria-orientation', 'vertical');
+    resizer.style.display = 'none';
+    if (panel.parentNode) panel.parentNode.insertBefore(resizer, panel);
+    var rdrag = null;
+    resizer.addEventListener('pointerdown', function (ev) {
+      ev.preventDefault();
+      rdrag = { id: ev.pointerId };
+      resizer.classList.add('is-active');
+      panel.classList.add('is-resizing');
+      document.body.classList.add('is-resizing-panel');
+      try { resizer.setPointerCapture(ev.pointerId); } catch (e) { /* gone */ }
+    });
+    resizer.addEventListener('pointermove', function (ev) {
+      if (!rdrag) return;
+      var rect = panel.parentNode.getBoundingClientRect();
+      var w = clampW(rect.right - ev.clientX);
+      panelWidth = w; panel.style.width = w + 'px'; resize();
+    });
+    function endResize() {
+      if (!rdrag) return;
+      var id = rdrag.id; rdrag = null;
+      resizer.classList.remove('is-active');
+      panel.classList.remove('is-resizing');
+      document.body.classList.remove('is-resizing-panel');
+      if (resizer.hasPointerCapture && resizer.hasPointerCapture(id)) resizer.releasePointerCapture(id);
+      resize();
+    }
+    resizer.addEventListener('pointerup', endResize);
+    resizer.addEventListener('pointercancel', endResize);
+    resizer.addEventListener('dblclick', function () {
+      panelWidth = null;
+      panel.style.width = clampW((window.innerWidth || 1200) * 0.65) + 'px';
+      resize();
+    });
+
+    window.addEventListener('resize', function () {
+      resize();
+      if (panel.classList.contains('is-open')) {
+        panel.style.width = clampW(panelWidth || (window.innerWidth || 1200) * 0.65) + 'px';
+      }
+    });
     fit();
   }
 
