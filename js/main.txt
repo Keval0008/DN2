@@ -224,15 +224,31 @@
 
     $('btn-html').addEventListener('click', function () {
       if (!state.layout) { toast('Load a JSON first.', 'error'); return; }
+      var html;
       try {
-        var html = Freeze.toHTML({
+        html = Freeze.toHTML({
           svg: els.svg, layout: state.layout, parsed: state.parsed, direction: state.direction
         });
-        Freeze.download(html, filename('html'));
-        toast('Saved standalone HTML', 'ok');
       } catch (err) {
         toast('Could not build HTML — ' + err.message, 'error');
+        return;
       }
+      var name = filename('html');
+      // Inside the pywebview app, let Python show a real "Save As…" dialog
+      // (WebView2 otherwise swallows the browser download).
+      if (window.pywebview && window.pywebview.api && window.pywebview.api.save_html) {
+        window.pywebview.api.save_html(html, name).then(function (res) {
+          if (res && res.ok) toast('Saved to ' + res.path, 'ok');
+          else if (res && res.canceled) toast('Save canceled', 'error');
+          else toast('Could not save the file.', 'error');
+        }).catch(function (e) {
+          toast('Could not save — ' + (e && e.message || e), 'error');
+        });
+        return;
+      }
+      // Plain browser: normal download to the Downloads folder.
+      Freeze.download(html, name);
+      toast('Saved standalone HTML', 'ok');
     });
 
     /* search */
