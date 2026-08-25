@@ -1,7 +1,9 @@
 """launcher.py — open the pipeline-graph web app in a native desktop window.
 
-This does NOT touch the web app. It just points pywebview at the existing
-app/index.html, whose css/ and js/ load relative to it exactly as before.
+This does NOT touch the web app. It points pywebview at the existing
+app/index.html, and exposes a small Python bridge so the in-app "Save HTML"
+button can pop a real "Save As…" dialog (WebView2 otherwise swallows the
+browser download).
 
 Run in dev:   python launcher.py
 Build an exe: see build.bat (or the pyinstaller command in the README)
@@ -12,20 +14,58 @@ import sys
 import webview
 
 
-def resource_path(relative):
-    """Absolute path to a bundled file, working both in dev and once frozen.
+def app_dir():
+    """Folder the app is *stored in* — the .exe's folder when frozen, or this
+    script's folder in dev. Used as the default location for saved files.
 
-    PyInstaller's --onefile extracts bundled data to a temp dir it exposes as
-    sys._MEIPASS; in plain `python launcher.py` we fall back to this file's dir.
+    Note: with PyInstaller --onefile, sys._MEIPASS is a temporary unpack dir,
+    NOT where the exe lives; sys.executable is the exe itself.
     """
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def resource_path(relative):
+    """Absolute path to a bundled file (dev and PyInstaller-frozen alike)."""
     base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(base, relative)
+
+
+class Bridge:
+    """Exposed to the page as window.pywebview.api.*"""
+
+    def save_html(self, html, suggested_name):
+        """Write the exported standalone HTML to a user-chosen path.
+
+        Returns a small dict the page can react to: {ok, path} on success,
+        {ok: False, canceled: True} if dismissed, or {ok: False, error} on failure.
+        """
+        try:
+            window = webview.windows[0]
+            result = window.create_file_dialog(
+                webview.SAVE_DIALOG,
+                directory=app_dir(),                     # default to the app's own folder
+                save_filename=suggested_name or "pipeline.html",
+                file_types=("HTML file (*.html)", "All files (*.*)"),
+            )
+            if not result:
+                return {"ok": False, "canceled": True}
+
+            path = result[0] if isinstance(result, (list, tuple)) else result
+            if not path.lower().endswith(".html"):
+                path += ".html"
+
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(html)
+            return {"ok": True, "path": path}
+        except Exception as exc:  # surfaced to the page as a toast
+            return {"ok": False, "error": str(exc)}
 
 
 def main():
     index = resource_path(os.path.join("app", "index.html"))
     if not os.path.isfile(index):
-        # Clear message instead of a blank window if the app folder wasn't bundled.
         sys.stderr.write("Could not find app/index.html next to the launcher.\n")
         sys.exit(1)
 
@@ -35,6 +75,7 @@ def main():
         width=1280,
         height=820,
         min_size=(720, 480),
+        js_api=Bridge(),
     )
     # gui is auto-detected (EdgeChromium/WebView2 on Windows). To force it:
     # webview.start(gui="edgechromium")
