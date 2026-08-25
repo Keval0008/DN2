@@ -365,7 +365,7 @@
     /* Parallel badged edges between the same pair would stack; fan their labels out. */
     var pairs = Object.create(null);
     edges.forEach(function (e) {
-      var k = e.from + ' ' + e.to;
+      var k = e.from + '' + e.to;
       (pairs[k] || (pairs[k] = [])).push(e);
     });
     Object.keys(pairs).forEach(function (k) {
@@ -373,7 +373,7 @@
       if (group.length < 2) return;
       group.forEach(function (e, i) { e.t = (i + 1) / (group.length + 1); });
     });
-
+ 
     /* Adjacency + roles. */
     var succ = Object.create(null);
     var pred = Object.create(null);
@@ -392,10 +392,10 @@
       // A node with successors is never a terminal output, whatever its tags say.
       if (n.role === 'output' && succ[n.id].length && pred[n.id].length) n.role = 'intermediate';
     });
-
+ 
     return { nodes: nodes, byId: byId, edges: edges, succ: succ, pred: pred, mode: compact ? 'compact' : 'explicit' };
   }
-
+ 
   /* Datasets/ops reachable upstream and downstream of a node. */
   function lineage(graph, startId) {
     function walk(adjacency, key) {
@@ -415,7 +415,7 @@
     }
     return { up: walk(graph.pred, 'from'), down: walk(graph.succ, 'to') };
   }
-
+ 
   global.Model = {
     parse: parse,
     buildGraph: buildGraph,
@@ -433,3 +433,4 @@
     DS_LINE_H: DS_LINE_H
   };
 })(window);
+ 
