@@ -574,6 +574,14 @@
     search: search,
     nextHit: nextHit,
     getSelection: function () { return S.selection ? S.selection.id : null; },
-    getTransform: function () { return { k: S.k, tx: S.tx, ty: S.ty }; }
+    getTransform: function () { return { k: S.k, tx: S.tx, ty: S.ty }; },
+    // Used by freeze.js to embed the exact panel logic in the exported file.
+    exportPanelFns: function () {
+      return {
+        esc: esc, chip: chip, linkList: linkList, cellText: cellText,
+        columnsView: columnsView, ioDatasetBlock: ioDatasetBlock,
+        renderDatasetPanel: renderDatasetPanel, renderOpPanel: renderOpPanel
+      };
+    }
   };
 })(window);
