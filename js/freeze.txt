@@ -82,6 +82,7 @@
     };
     var opById = {};
     B.operations.forEach(function (o) { opById[o.id] = o; });
+    var selection = null;
 
     /*__PANEL_FNS__*/
 
@@ -107,6 +108,7 @@
       panel.innerHTML = '';
       panel.style.width = '';
       if (resizer) resizer.style.display = 'none';
+      selection = null;
       clearFocus();
     }
 
@@ -164,6 +166,8 @@
     }
 
     function selectNodeId(nodeId) {
+      if (selection && selection.type === 'node' && selection.id === nodeId) { closePanel(); return; }
+      selection = { type: 'node', id: nodeId };
       applyAbove(nodeId, aboveOf(nodeId), null);
       var realId = nodeId.indexOf('op:') === 0 ? nodeId.slice(3) : nodeId;
       if (S.parsed.datasets[realId]) renderDatasetPanel(S.parsed.datasets[realId]);
@@ -172,6 +176,8 @@
     function selectOpBadge(opid) {
       var op = opById[opid];
       if (!op) return;
+      if (selection && selection.type === 'op' && selection.id === opid) { closePanel(); return; }
+      selection = { type: 'op', id: opid };
       var above = {};
       (reverse ? op.to : op.from).forEach(function (s) {
         above[s] = true;
