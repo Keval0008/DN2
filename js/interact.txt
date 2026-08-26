@@ -158,8 +158,12 @@
   function selectNode(node) {
     var graph = S.layout.graph;
     var lin = Model.lineage(graph, node.id);
+    var reverse = S.layout && S.layout.direction === 'reverse';
+    var empty = Object.create(null);
     S.selection = { type: 'node', id: node.id };
-    applyFocus([node.id], lin.up, lin.down);
+    // Show only what sits visually above the node: upstream in forward,
+    // downstream in reverse. Everything else fades.
+    applyFocus([node.id], reverse ? empty : lin.up, reverse ? lin.down : empty);
     if (node.kind === 'op') renderOpPanel(node.data);
     else renderDatasetPanel(node.data);
   }
@@ -179,8 +183,12 @@
       down[t] = true;
       merge(down, Model.lineage(graph, t).down);
     });
+    var reverse = S.layout && S.layout.direction === 'reverse';
+    var empty = Object.create(null);
     S.selection = { type: 'op', id: op.id };
-    applyFocus([], up, down, op.id);
+    // Above the operation: its inputs (upstream) in forward, its outputs
+    // (downstream) in reverse. The other side fades.
+    applyFocus([], reverse ? empty : up, reverse ? down : empty, op.id);
     renderOpPanel(op);
   }
 
