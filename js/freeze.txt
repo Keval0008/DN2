@@ -61,6 +61,15 @@
     return roles;
   }
 
+  // Plain from/to edge list of the *rendered* graph, so the frozen viewer can
+  // walk lineage (which nodes are upstream / downstream of a clicked one)
+  // without pulling in the layout code.
+  function edgesFrom(layout) {
+    return layout.graph.edges.map(function (e) {
+      return { id: e.id, from: e.from, to: e.to, op: e.op ? e.op.id : null };
+    });
+  }
+
   /* The runtime embedded in the exported file. Written as a real function so it
      can be linted/tested; it is serialised with toString() at export time, and
      the exact panel-rendering functions are spliced in at the marker. */
@@ -98,10 +107,86 @@
       panel.innerHTML = '';
       panel.style.width = '';
       if (resizer) resizer.style.display = 'none';
+      clearFocus();
+    }
+
+    // ---- lineage focus: light the clicked item + everything visually above it,
+    //      fade the rest. "Above" = upstream in forward, downstream in reverse. ----
+    var reverse = B.direction === 'reverse';
+    var succ = {}, pred = {};
+    (B.edges || []).forEach(function (e) {
+      (succ[e.from] || (succ[e.from] = [])).push(e);
+      (pred[e.to] || (pred[e.to] = [])).push(e);
+    });
+    function walk(adj, key, start) {
+      var seen = {}, stack = [start];
+      while (stack.length) {
+        var cur = stack.pop();
+        (adj[cur] || []).forEach(function (e) {
+          var nx = e[key];
+          if (seen[nx]) return;
+          seen[nx] = true; stack.push(nx);
+        });
+      }
+      delete seen[start];
+      return seen;
+    }
+    function aboveOf(startId) {
+      return reverse ? walk(succ, 'to', startId) : walk(pred, 'from', startId);
+    }
+
+    var nodeEls = {}, edgeEls = {}, badgeEls = {};
+    Array.prototype.forEach.call(svg.querySelectorAll('[data-node]'), function (el) { nodeEls[el.getAttribute('data-node')] = el; });
+    Array.prototype.forEach.call(svg.querySelectorAll('.edge[data-edge]'), function (el) { edgeEls[el.getAttribute('data-edge')] = el; });
+    Array.prototype.forEach.call(svg.querySelectorAll('.badge[data-op]'), function (el) { badgeEls[el.getAttribute('data-op')] = el; });
+
+    function clearFocus() {
+      vp.classList.remove('has-focus');
+      Object.keys(nodeEls).forEach(function (id) { nodeEls[id].classList.remove('is-focus', 'is-up', 'is-down'); });
+      Object.keys(edgeEls).forEach(function (id) { edgeEls[id].classList.remove('is-lineage'); });
+      Object.keys(badgeEls).forEach(function (id) { badgeEls[id].classList.remove('is-lineage'); });
+    }
+    function applyAbove(focusNodeId, aboveSet, focusBadgeId) {
+      var lit = {};
+      if (focusNodeId) lit[focusNodeId] = 'focus';
+      Object.keys(aboveSet).forEach(function (id) { if (!lit[id]) lit[id] = 'up'; });
+      vp.classList.add('has-focus');
+      Object.keys(nodeEls).forEach(function (id) {
+        nodeEls[id].classList.remove('is-focus', 'is-up', 'is-down');
+        if (lit[id]) nodeEls[id].classList.add('is-' + lit[id]);
+      });
+      (B.edges || []).forEach(function (e) {
+        var on = lit[e.from] && lit[e.to];
+        if (edgeEls[e.id]) edgeEls[e.id].classList.toggle('is-lineage', !!on);
+        if (e.op && badgeEls[e.op]) badgeEls[e.op].classList.toggle('is-lineage', !!on);
+      });
+      if (focusBadgeId && badgeEls[focusBadgeId]) badgeEls[focusBadgeId].classList.add('is-lineage');
+    }
+
+    function selectNodeId(nodeId) {
+      applyAbove(nodeId, aboveOf(nodeId), null);
+      var realId = nodeId.indexOf('op:') === 0 ? nodeId.slice(3) : nodeId;
+      if (S.parsed.datasets[realId]) renderDatasetPanel(S.parsed.datasets[realId]);
+      else if (opById[realId]) renderOpPanel(opById[realId]);
+    }
+    function selectOpBadge(opid) {
+      var op = opById[opid];
+      if (!op) return;
+      var above = {};
+      (reverse ? op.to : op.from).forEach(function (s) {
+        above[s] = true;
+        var w = aboveOf(s);
+        Object.keys(w).forEach(function (k) { above[k] = true; });
+      });
+      applyAbove(null, above, opid);
+      renderOpPanel(op);
     }
     function selectById(id) {
-      if (S.parsed.datasets[id]) renderDatasetPanel(S.parsed.datasets[id]);
-      else if (opById[id]) renderOpPanel(opById[id]);
+      if (S.parsed.datasets[id]) { selectNodeId(id); return; }
+      if (opById[id]) {
+        if (nodeEls['op:' + id]) selectNodeId('op:' + id);
+        else selectOpBadge(id);
+      }
     }
 
     // ---- pan / zoom ----
@@ -169,13 +254,9 @@
 
     stage.addEventListener('click', function (ev) {
       var nodeEl = ev.target.closest && ev.target.closest('[data-node]');
-      if (nodeEl) {
-        var id = nodeEl.getAttribute('data-node');
-        selectById(id.indexOf('op:') === 0 ? id.slice(3) : id);
-        return;
-      }
+      if (nodeEl) { selectNodeId(nodeEl.getAttribute('data-node')); return; }
       var badge = ev.target.closest && ev.target.closest('[data-op]');
-      if (badge) { selectById(badge.getAttribute('data-op')); return; }
+      if (badge) { selectOpBadge(badge.getAttribute('data-op')); return; }
       closePanel();
     });
 
@@ -256,7 +337,8 @@
       layout: { width: Math.ceil(layout.width), height: Math.ceil(layout.height) },
       datasets: parsed.datasets,
       operations: parsed.operations,
-      roles: rolesFrom(layout)
+      roles: rolesFrom(layout),
+      edges: edgesFrom(layout)
     };
 
     var fns = Interact.exportPanelFns();
