@@ -156,6 +156,11 @@
   }
 
   function selectNode(node) {
+    // Second click on the same node restores the full (un-dimmed) view.
+    if (S.selection && S.selection.type === 'node' && S.selection.id === node.id) {
+      closePanel();
+      return;
+    }
     var graph = S.layout.graph;
     var lin = Model.lineage(graph, node.id);
     var reverse = S.layout && S.layout.direction === 'reverse';
@@ -172,6 +177,11 @@
     var graph = S.layout.graph;
     var nodeId = 'op:' + op.id;
     if (graph.byId[nodeId]) { selectNode(graph.byId[nodeId]); return; }
+    // Second click on the same badge restores the full (un-dimmed) view.
+    if (S.selection && S.selection.type === 'op' && S.selection.id === op.id) {
+      closePanel();
+      return;
+    }
     // Collapsed into an edge badge: light the datasets on either side plus their lineage.
     var up = Object.create(null);
     var down = Object.create(null);
